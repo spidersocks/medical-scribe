@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from starlette.websockets import WebSocketState
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 # config
 logging.basicConfig(level=logging.INFO)
@@ -37,15 +38,16 @@ AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS")
 allowed_origins = ALLOWED_ORIGINS_STR.split(',') if ALLOWED_ORIGINS_STR else []
 
-app = FastAPI(title="Stethoscribe Proxy", version="1.0.0") # Renamed for consistency
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    # Use the variable here
-    allow_origins=allowed_origins if allowed_origins else ["http://localhost:3000"], # Default for local dev
-    allow_credentials=True,
+    allow_origins=allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True
 )
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["www.seanfontaine.dev", "seanfontaine.dev"])
 
 comprehend_medical = boto3.client("comprehendmedical", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
