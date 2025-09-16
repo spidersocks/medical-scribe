@@ -362,6 +362,25 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
     return note
 
 
+@app.get("/debug-config")
+async def debug_config():
+    """
+    An endpoint to check the live configuration on the server.
+    Helps verify that environment variables are being read correctly.
+    """
+    allowed_origins_env = os.getenv("ALLOWED_ORIGINS")
+    
+    # Replicate the logic from your middleware setup
+    origins_list = allowed_origins_env.split(',') if allowed_origins_env else []
+    
+    return {
+        "message": "Live server configuration check.",
+        "ALLOWED_ORIGINS_from_env": allowed_origins_env,
+        "parsed_origins_list_for_cors": origins_list,
+        "default_fallback_would_be": ["http://localhost:3000"]
+    }
+
+
 @app.post("/generate-final-note")
 async def generate_final_note(payload: FinalNotePayload):
     logger.info(f"Received full transcript for final note generation. Size: {len(payload.full_transcript)} chars.")
