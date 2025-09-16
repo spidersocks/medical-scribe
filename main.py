@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from starlette.websockets import WebSocketState
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 # config
 logging.basicConfig(level=logging.INFO)
@@ -35,19 +34,21 @@ AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 
+# This logic is now bypassed by the change below, but kept for easy reversion
 ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS")
 allowed_origins = ALLOWED_ORIGINS_STR.split(',') if ALLOWED_ORIGINS_STR else []
 
-app = FastAPI()
+app = FastAPI(title="Stethoscribe Proxy", version="1.0.0")
+
+# --- CHANGE: Set allow_origins to ["*"] to open access for testing ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # This allows all origins
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True
 )
-
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["www.seanfontaine.dev", "seanfontaine.dev"])
+# --- END OF CHANGE ---
 
 comprehend_medical = boto3.client("comprehendmedical", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
@@ -362,25 +363,6 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info(f"Normalizing empty/verbose section '{section}' to 'None'.")
                 note[section] = "None"
     return note
-
-
-@app.get("/debug-config")
-async def debug_config():
-    """
-    An endpoint to check the live configuration on the server.
-    Helps verify that environment variables are being read correctly.
-    """
-    allowed_origins_env = os.getenv("ALLOWED_ORIGINS")
-    
-    # Replicate the logic from your middleware setup
-    origins_list = allowed_origins_env.split(',') if allowed_origins_env else []
-    
-    return {
-        "message": "Live server configuration check.",
-        "ALLOWED_ORIGINS_from_env": allowed_origins_env,
-        "parsed_origins_list_for_cors": origins_list,
-        "default_fallback_would_be": ["http://localhost:3000"]
-    }
 
 
 @app.post("/generate-final-note")
