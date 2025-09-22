@@ -52,6 +52,7 @@ app.add_middleware(
 
 comprehend_medical = boto3.client("comprehendmedical", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+translate = boto3.client("translate", region_name=AWS_REGION)
 
 class FinalNotePayload(BaseModel):
     full_transcript: str
@@ -142,23 +143,26 @@ def get_signature_key(secret_key: str, date_stamp: str, region_name: str, servic
     k_service = hmac.new(k_region, service_name.encode("utf-8"), hashlib.sha256).digest()
     return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
 
-def build_presigned_url() -> str:
+def build_presigned_url(language_code: str) -> str:
     method = "GET"
-    service = "transcribe"
+    service = "transcribe" # Use standard transcribe service
     host = f"transcribestreaming.{AWS_REGION}.amazonaws.com:8443"
-    endpoint = f"wss://{host}/medical-stream-transcription-websocket"
+    # MODIFIED: Use the standard websocket endpoint
+    endpoint = f"wss://{host}/stream-transcription-websocket"
+    
     t = datetime.now(timezone.utc)
     amz_date = t.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = t.strftime("%Y%m%d")
-    canonical_uri = "/medical-stream-transcription-websocket"
+    # MODIFIED: Use the standard websocket URI
+    canonical_uri = "/stream-transcription-websocket"
     
+    # MODIFIED: Update query parameters for standard Transcribe
     query_params = {
-        "language-code": "en-US",
+        "language-code": language_code, # e.g., 'zh-HK' or 'zh-CN'
         "media-encoding": "pcm",
         "sample-rate": "16000",
-        "specialty": "PRIMARYCARE",
-        "type": "CONVERSATION",
         "show-speaker-label": "true",
+        # Removed medical-specific params: "specialty", "type"
         "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
         "X-Amz-Credential": f"{AWS_ACCESS_KEY}/{date_stamp}/{AWS_REGION}/{service}/aws4_request",
         "X-Amz-Date": amz_date,
@@ -167,6 +171,7 @@ def build_presigned_url() -> str:
     }
     if AWS_SESSION_TOKEN:
         query_params["X-Amz-Security-Token"] = quote(AWS_SESSION_TOKEN)
+    
     canonical_querystring = "&".join(f"{k}={quote(str(v), safe='~')}" for k, v in sorted(query_params.items()))
     canonical_headers = f"host:{host}\n"
     signed_headers = "host"
@@ -176,20 +181,22 @@ def build_presigned_url() -> str:
     string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
     signing_key = get_signature_key(AWS_SECRET_KEY, date_stamp, AWS_REGION, service)
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    
     return f"{endpoint}?{canonical_querystring}&X-Amz-Signature={signature}"
 
 # websocket code
 @app.websocket("/client-transcribe")
-async def client_transcribe(ws: WebSocket):
+async def client_transcribe(ws: WebSocket, language_code: str = "en-US"):
     await ws.accept()
-    logger.info("📡 Browser connected")
-    aws_url = build_presigned_url()
-    logger.info("Connecting to AWS Transcribe...")
+    logger.info(f"📡 Browser connected for language: {language_code}")
+    # MODIFIED: Pass language_code to the URL builder
+    aws_url = build_presigned_url(language_code)
+    logger.info(f"Connecting to AWS Transcribe ({language_code})...")
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(aws_url, max_msg_size=0) as aws_ws:
-                logger.info("✅ Connected to AWS Transcribe Medical")
+                logger.info(f"✅ Connected to AWS Transcribe ({language_code})")
                 
                 async def forward_to_aws():
                     try:
@@ -209,14 +216,38 @@ async def client_transcribe(ws: WebSocket):
                                 payload = event['payload']
                                 try:
                                     results = payload.get("Transcript", {}).get("Results", [])
+                                    # Process only final (not partial) results
                                     if results and not results[0].get("IsPartial", True):
-                                        transcript_text = results[0].get("Alternatives", [{}])[0].get("Transcript", "")
-                                        if transcript_text:
-                                            comprehend_result = comprehend_medical.detect_entities_v2(Text=transcript_text)
+                                        original_text = results[0].get("Alternatives", [{}])[0].get("Transcript", "")
+                                        
+                                        if original_text and language_code != "en-US":
+                                            # --- NEW: TRANSLATION LOGIC ---
+                                            # Amazon Translate uses 'zh' for both Mandarin and Cantonese
+                                            source_lang = language_code.split('-')[0]
+                                            
+                                            translation_response = translate.translate_text(
+                                                Text=original_text,
+                                                SourceLanguageCode=source_lang,
+                                                TargetLanguageCode='en'
+                                            )
+                                            english_text = translation_response['TranslatedText']
+                                            
+                                            # --- Run Comprehend on the TRANSLATED text ---
+                                            comprehend_result = comprehend_medical.detect_entities_v2(Text=english_text)
+                                            
+                                            # --- Augment the payload for the frontend ---
                                             payload["ComprehendEntities"] = comprehend_result.get("Entities", [])
-                                            logger.info(f"Found {len(payload['ComprehendEntities'])} entities in segment.")
+                                            payload["TranslatedText"] = english_text # Send translated text to frontend
+                                            logger.info(f"Translated segment and found {len(payload['ComprehendEntities'])} entities.")
+                                        
+                                        elif original_text and language_code == "en-US":
+                                            # --- Maintain original logic for English ---
+                                            comprehend_result = comprehend_medical.detect_entities_v2(Text=original_text)
+                                            payload["ComprehendEntities"] = comprehend_result.get("Entities", [])
+                                            logger.info(f"Found {len(payload['ComprehendEntities'])} entities in English segment.")
+
                                 except Exception as e:
-                                    logger.error(f"Comprehend Medical real-time error: {e}")
+                                    logger.error(f"Real-time processing error: {e}")
 
                                 if ws.client_state == WebSocketState.CONNECTED:
                                     await ws.send_text(json.dumps(payload))
@@ -370,9 +401,25 @@ async def generate_final_note(payload: FinalNotePayload):
     logger.info(f"Received full transcript for final note generation. Size: {len(payload.full_transcript)} chars.")
     if not payload.full_transcript.strip():
         raise HTTPException(status_code=400, detail="Received an empty transcript.")
+    
     try:
-        logger.info("Running AWS Comprehend Medical on full transcript...")
-        result = comprehend_medical.detect_entities_v2(Text=payload.full_transcript)
+        # --- NEW: Check if the transcript needs translation ---
+        # A simple heuristic: if it contains Chinese characters.
+        if re.search(r'[\u4e00-\u9fff]', payload.full_transcript):
+            logger.info("Chinese transcript detected. Translating to English for processing...")
+            translation_response = translate.translate_text(
+                Text=payload.full_transcript,
+                SourceLanguageCode='zh', # General Chinese is sufficient here
+                TargetLanguageCode='en'
+            )
+            english_transcript = translation_response['TranslatedText']
+            logger.info(f"Translation complete. English transcript size: {len(english_transcript)} chars.")
+        else:
+            english_transcript = payload.full_transcript
+
+        # --- The rest of the logic now uses the guaranteed-to-be-English transcript ---
+        logger.info("Running AWS Comprehend Medical on full English transcript...")
+        result = comprehend_medical.detect_entities_v2(Text=english_transcript)
         all_entities = result.get('Entities', [])
         logger.info(f"Comprehend found {len(all_entities)} total entities.")
         
@@ -380,10 +427,11 @@ async def generate_final_note(payload: FinalNotePayload):
             {"Text": e["Text"], "Category": e["Category"], "Type": e["Type"]}
             for e in all_entities
         ]
-        logger.info(f"Simplified {len(all_entities)} entities to save prompt tokens.")
+        
+        # This function now receives the English transcript
+        final_note = generate_note_from_scratch(simplified_entities, english_transcript)
 
-        final_note = generate_note_from_scratch(simplified_entities, payload.full_transcript)
-
+        # Post-processing functions remain the same
         structured_note = _fix_pertinent_negatives(final_note)
         normalized_note = _normalize_empty_sections(structured_note)
         formatted_note = _normalize_assessment_plan(normalized_note)
