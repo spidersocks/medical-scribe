@@ -34,19 +34,19 @@ AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 
-# This logic is now bypassed by the change below, but kept for easy reversion
 ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "")
 allowed_origins = [o.strip() for o in ALLOWED_ORIGINS_STR.split(",") if o.strip()]
 
+app = FastAPI(title="Stethoscribe Proxy", version="1.0.0")
+
 app.add_middleware(
-CORSMiddleware,
-allow_origins=allowed_origins,
-allow_credentials=True,
-allow_methods=["GET", "POST", "OPTIONS"],
-allow_headers=["Content-Type", "Authorization"],
-max_age=86400, # cache preflight 1 day
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=86400,  # cache preflight 1 day
 )
-# --- END OF CHANGE ---
 
 comprehend_medical = boto3.client("comprehendmedical", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
