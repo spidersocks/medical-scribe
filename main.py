@@ -35,18 +35,16 @@ AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 
 # This logic is now bypassed by the change below, but kept for easy reversion
-ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS")
-allowed_origins = ALLOWED_ORIGINS_STR.split(',') if ALLOWED_ORIGINS_STR else []
+ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "")
+allowed_origins = [o.strip() for o in ALLOWED_ORIGINS_STR.split(",") if o.strip()]
 
-app = FastAPI(title="Stethoscribe Proxy", version="1.0.0")
-
-# --- CHANGE: Set allow_origins to ["*"] to open access for testing ---
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # This allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+CORSMiddleware,
+allow_origins=allowed_origins,
+allow_credentials=True,
+allow_methods=["GET", "POST", "OPTIONS"],
+allow_headers=["Content-Type", "Authorization"],
+max_age=86400, # cache preflight 1 day
 )
 # --- END OF CHANGE ---
 
@@ -256,7 +254,7 @@ async def client_transcribe(ws: WebSocket):
                             ))
                     except WebSocketDisconnect:
                         logger.info("Browser disconnected. Sending end-of-stream to AWS.")
-                        if not aws_ws.closed and saw_audio:
+                        if not aws_ws.closed:
                             try:
                                 await aws_ws.send_bytes(_encode_event_stream(
                                     headers={
@@ -264,7 +262,7 @@ async def client_transcribe(ws: WebSocket):
                                         ':event-type': 'AudioEvent',
                                         ':content-type': 'application/octet-stream'
                                     },
-                                    payload=b''
+                                    payload=b''  # flush any pending partials
                                 ))
                                 await aws_ws.send_bytes(_encode_event_stream(
                                     headers={
