@@ -143,26 +143,33 @@ def get_signature_key(secret_key: str, date_stamp: str, region_name: str, servic
     k_service = hmac.new(k_region, service_name.encode("utf-8"), hashlib.sha256).digest()
     return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
 
-def build_presigned_url(language_code: str) -> str:
+def build_presigned_url(selected_language: str = "en-US") -> str:
+    # Enforce exactly one zh-* when English is primary, and ensure only one locale per family.
+    if selected_language in ("zh-HK", "zh-TW"):
+        # Chinese primary, English backup
+        language_options = f"{selected_language},en-US"
+    else:
+        # English primary, Cantonese backup (per your spec)
+        language_options = "en-US,zh-HK"
+
     method = "GET"
-    service = "transcribe" # Use standard transcribe service
+    service = "transcribe"
     host = f"transcribestreaming.{AWS_REGION}.amazonaws.com:8443"
-    # MODIFIED: Use the standard websocket endpoint
     endpoint = f"wss://{host}/stream-transcription-websocket"
-    
+
     t = datetime.now(timezone.utc)
     amz_date = t.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = t.strftime("%Y%m%d")
-    # MODIFIED: Use the standard websocket URI
     canonical_uri = "/stream-transcription-websocket"
-    
-    # MODIFIED: Update query parameters for standard Transcribe
+
     query_params = {
-        "language-code": language_code, # e.g., 'zh-HK' or 'zh-CN'
+        "identify-multiple-languages": "true",
+        "language-options": language_options,
+        # preferred-language is optional; we can set it to the first of language-options
+        "preferred-language": language_options.split(",", 1)[0],
+        "show-speaker-label":"true",
         "media-encoding": "pcm",
         "sample-rate": "16000",
-        "show-speaker-label": "true",
-        # Removed medical-specific params: "specialty", "type"
         "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
         "X-Amz-Credential": f"{AWS_ACCESS_KEY}/{date_stamp}/{AWS_REGION}/{service}/aws4_request",
         "X-Amz-Date": amz_date,
@@ -170,88 +177,156 @@ def build_presigned_url(language_code: str) -> str:
         "X-Amz-SignedHeaders": "host",
     }
     if AWS_SESSION_TOKEN:
-        query_params["X-Amz-Security-Token"] = quote(AWS_SESSION_TOKEN)
-    
-    canonical_querystring = "&".join(f"{k}={quote(str(v), safe='~')}" for k, v in sorted(query_params.items()))
+        query_params["X-Amz-Security-Token"] = AWS_SESSION_TOKEN  # not pre-encoded
+
+    canonical_querystring = "&".join(
+        f"{k}={quote(str(v), safe='~')}" for k, v in sorted(query_params.items())
+    )
     canonical_headers = f"host:{host}\n"
     signed_headers = "host"
     payload_hash = hashlib.sha256(b"").hexdigest()
-    canonical_request = f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    canonical_request = (
+        f"{method}\n"
+        f"{canonical_uri}\n"
+        f"{canonical_querystring}\n"
+        f"{canonical_headers}\n"
+        f"{signed_headers}\n"
+        f"{payload_hash}"
+    )
     credential_scope = f"{date_stamp}/{AWS_REGION}/{service}/aws4_request"
-    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n"
+        f"{credential_scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
     signing_key = get_signature_key(AWS_SECRET_KEY, date_stamp, AWS_REGION, service)
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-    
+
     return f"{endpoint}?{canonical_querystring}&X-Amz-Signature={signature}"
 
 # websocket code
 @app.websocket("/client-transcribe")
-async def client_transcribe(ws: WebSocket, language_code: str = "en-US"):
+async def client_transcribe(ws: WebSocket):
     await ws.accept()
-    logger.info(f"📡 Browser connected for language: {language_code}")
-    # MODIFIED: Pass language_code to the URL builder
-    aws_url = build_presigned_url(language_code)
-    logger.info(f"Connecting to AWS Transcribe ({language_code})...")
-    
+
+    # Read language_code from query (?language_code=en-US|zh-HK|zh-TW); default en-US
+    try:
+        q = dict(ws.query_params)
+    except Exception:
+        q = {}
+    language_code = q.get("language_code", "en-US")
+    if language_code not in ("en-US", "zh-HK", "zh-TW"):
+        language_code = "en-US"
+
+    # Log the primary+backup composition
+    if language_code in ("zh-HK", "zh-TW"):
+        language_options_log = f"{language_code},en-US"
+    else:
+        language_options_log = "en-US,zh-HK"
+
+    logger.info(f"📡 Browser connected. Dropdown selected={language_code}. Using language-options={language_options_log}")
+
+    aws_url = build_presigned_url(selected_language=language_code)
+    logger.info("Connecting to AWS Transcribe with computed language-options...")
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(aws_url, max_msg_size=0) as aws_ws:
-                logger.info(f"✅ Connected to AWS Transcribe ({language_code})")
-                
+                logger.info("✅ Connected to AWS Transcribe")
+
                 async def forward_to_aws():
+                    saw_audio = False
                     try:
                         while True:
                             data = await ws.receive_bytes()
-                            await aws_ws.send_bytes(_encode_event_stream(headers={':message-type': 'event',':event-type': 'AudioEvent',':content-type': 'application/octet-stream'}, payload=data))
+                            if data:
+                                saw_audio = True
+                                logger.debug(f"Forwarding audio chunk: {len(data)} bytes")
+                            else:
+                                logger.warning("Received empty audio chunk from client.")
+                            await aws_ws.send_bytes(_encode_event_stream(
+                                headers={
+                                    ':message-type': 'event',
+                                    ':event-type': 'AudioEvent',
+                                    ':content-type': 'application/octet-stream'
+                                },
+                                payload=data
+                            ))
                     except WebSocketDisconnect:
                         logger.info("Browser disconnected. Sending end-of-stream to AWS.")
-                        if not aws_ws.closed:
-                            await aws_ws.send_bytes(_encode_event_stream(headers={':message-type': 'event',':event-type': 'AudioEvent',':content-type': 'application/octet-stream'}, payload=b''))
-                
+                        if not aws_ws.closed and saw_audio:
+                            try:
+                                await aws_ws.send_bytes(_encode_event_stream(
+                                    headers={
+                                        ':message-type': 'event',
+                                        ':event-type': 'AudioEvent',
+                                        ':content-type': 'application/octet-stream'
+                                    },
+                                    payload=b''
+                                ))
+                                await aws_ws.send_bytes(_encode_event_stream(
+                                    headers={
+                                        ':message-type': 'event',
+                                        ':event-type': 'EndOfStream'
+                                    },
+                                    payload=b''
+                                ))
+                            except Exception as e:
+                                logger.warning(f"Error while sending EndOfStream: {e}")
+
                 async def forward_to_client():
                     parser = EventStreamParser()
                     async for msg in aws_ws:
                         if msg.type == aiohttp.WSMsgType.BINARY:
                             for event in parser.parse(msg.data):
+                                etype = event.get('type')
+                                if etype != 'TranscriptEvent':
+                                    logger.error(f"AWS non-transcript event: type={etype} headers={event.get('headers')} payload={event.get('payload')}")
+                                    continue
+
                                 payload = event['payload']
                                 try:
                                     results = payload.get("Transcript", {}).get("Results", [])
-                                    # Process only final (not partial) results
-                                    if results and not results[0].get("IsPartial", True):
-                                        original_text = results[0].get("Alternatives", [{}])[0].get("Transcript", "")
-                                        
-                                        if original_text and language_code != "en-US":
-                                            # --- NEW: TRANSLATION LOGIC ---
-                                            # Amazon Translate uses 'zh' for both Mandarin and Cantonese
-                                            source_lang = language_code.split('-')[0]
-                                            
-                                            translation_response = translate.translate_text(
-                                                Text=original_text,
-                                                SourceLanguageCode=source_lang,
-                                                TargetLanguageCode='en'
-                                            )
-                                            english_text = translation_response['TranslatedText']
-                                            
-                                            # --- Run Comprehend on the TRANSLATED text ---
-                                            comprehend_result = comprehend_medical.detect_entities_v2(Text=english_text)
-                                            
-                                            # --- Augment the payload for the frontend ---
-                                            payload["ComprehendEntities"] = comprehend_result.get("Entities", [])
-                                            payload["TranslatedText"] = english_text # Send translated text to frontend
-                                            logger.info(f"Translated segment and found {len(payload['ComprehendEntities'])} entities.")
-                                        
-                                        elif original_text and language_code == "en-US":
-                                            # --- Maintain original logic for English ---
-                                            comprehend_result = comprehend_medical.detect_entities_v2(Text=original_text)
-                                            payload["ComprehendEntities"] = comprehend_result.get("Entities", [])
-                                            logger.info(f"Found {len(payload['ComprehendEntities'])} entities in English segment.")
+                                    if not results:
+                                        continue
+                                    result = results[0]
+                                    if result.get("IsPartial", True):
+                                        if ws.client_state == WebSocketState.CONNECTED:
+                                            await ws.send_text(json.dumps(payload))
+                                        continue
+
+                                    original_text = result.get("Alternatives", [{}])[0].get("Transcript", "")
+                                    if not original_text:
+                                        continue
+
+                                    detected_language = result.get("LanguageCode", "en-US")
+                                    payload["DisplayText"] = original_text
+
+                                    if detected_language == "en-US":
+                                        english_text = original_text
+                                    else:
+                                        # Translate from detected family (zh for zh-HK/zh-TW)
+                                        source_lang = detected_language.split('-')[0]
+                                        translation_response_en = translate.translate_text(
+                                            Text=original_text,
+                                            SourceLanguageCode=source_lang,
+                                            TargetLanguageCode='en'
+                                        )
+                                        english_text = translation_response_en['TranslatedText']
+                                        payload["TranslatedText"] = english_text
+
+                                    comprehend_result = comprehend_medical.detect_entities_v2(Text=english_text)
+                                    payload["ComprehendEntities"] = comprehend_result.get("Entities", [])
+                                    logger.info(f"Processed final segment in '{detected_language}', entities={len(payload['ComprehendEntities'])}")
 
                                 except Exception as e:
                                     logger.error(f"Real-time processing error: {e}")
 
                                 if ws.client_state == WebSocketState.CONNECTED:
                                     await ws.send_text(json.dumps(payload))
-                    
+
                     if aws_ws.close_code != 1000:
                         reason = aws_ws.exception() or f"Code: {aws_ws.close_code}"
                         raise ConnectionAbortedError(f"AWS connection closed unexpectedly. Reason: {reason}")
