@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 from zlib import crc32
 import re
-
 import uvicorn
 import aiohttp
 import boto3
@@ -21,7 +20,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
-
 from starlette.websockets import WebSocketState
 
 # config
@@ -29,6 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scribe-proxy")
 load_dotenv()
 
+# access variables securely stored in ENV variables
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -142,12 +141,12 @@ def get_signature_key(secret_key: str, date_stamp: str, region_name: str, servic
     return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
 
 def build_presigned_url(selected_language: str = "en-US") -> str:
-    # Enforce exactly one zh-* when English is primary, and ensure only one locale per family.
+    # Enforcing only one Chinese language option when English is primary (AWS doesn't support dialecte detection yet)
     if selected_language in ("zh-HK", "zh-TW"):
         # Chinese primary, English backup
         language_options = f"{selected_language},en-US"
     else:
-        # English primary, Cantonese backup (per your spec)
+        # English primary, Cantonese backup
         language_options = "en-US,zh-HK"
 
     method = "GET"
@@ -163,7 +162,7 @@ def build_presigned_url(selected_language: str = "en-US") -> str:
     query_params = {
         "identify-multiple-languages": "true",
         "language-options": language_options,
-        # preferred-language is optional; we can set it to the first of language-options
+        # preferred-language defaults to English
         "preferred-language": language_options.split(",", 1)[0],
         "show-speaker-label":"true",
         "media-encoding": "pcm",
@@ -175,7 +174,7 @@ def build_presigned_url(selected_language: str = "en-US") -> str:
         "X-Amz-SignedHeaders": "host",
     }
     if AWS_SESSION_TOKEN:
-        query_params["X-Amz-Security-Token"] = AWS_SESSION_TOKEN  # not pre-encoded
+        query_params["X-Amz-Security-Token"] = AWS_SESSION_TOKEN 
 
     canonical_querystring = "&".join(
         f"{k}={quote(str(v), safe='~')}" for k, v in sorted(query_params.items())
@@ -209,7 +208,7 @@ def build_presigned_url(selected_language: str = "en-US") -> str:
 async def client_transcribe(ws: WebSocket):
     await ws.accept()
 
-    # Read language_code from query (?language_code=en-US|zh-HK|zh-TW); default en-US
+    # read language_code from query (?language_code=en-US|zh-HK|zh-TW); default en-US
     try:
         q = dict(ws.query_params)
     except Exception:
@@ -218,7 +217,7 @@ async def client_transcribe(ws: WebSocket):
     if language_code not in ("en-US", "zh-HK", "zh-TW"):
         language_code = "en-US"
 
-    # Log the primary+backup composition
+    # log the primary+backup composition
     if language_code in ("zh-HK", "zh-TW"):
         language_options_log = f"{language_code},en-US"
     else:
@@ -246,9 +245,9 @@ async def client_transcribe(ws: WebSocket):
                                 logger.warning("Received empty audio chunk from client.")
                             await aws_ws.send_bytes(_encode_event_stream(
                                 headers={
-                                    ':message-type': 'event',
-                                    ':event-type': 'AudioEvent',
-                                    ':content-type': 'application/octet-stream'
+                                    ":message-type": "event",
+                                    ":event-type": "AudioEvent",
+                                    ":content-type": "application/octet-stream"
                                 },
                                 payload=data
                             ))
@@ -258,16 +257,16 @@ async def client_transcribe(ws: WebSocket):
                             try:
                                 await aws_ws.send_bytes(_encode_event_stream(
                                     headers={
-                                        ':message-type': 'event',
-                                        ':event-type': 'AudioEvent',
-                                        ':content-type': 'application/octet-stream'
+                                        ":message-type": "event",
+                                        ":event-type": "AudioEvent",
+                                        ":content-type": "application/octet-stream"
                                     },
                                     payload=b''  # flush any pending partials
                                 ))
                                 await aws_ws.send_bytes(_encode_event_stream(
                                     headers={
-                                        ':message-type': 'event',
-                                        ':event-type': 'EndOfStream'
+                                        ":message-type": "event",
+                                        ":event-type": "EndOfStream"
                                     },
                                     payload=b''
                                 ))
@@ -279,8 +278,8 @@ async def client_transcribe(ws: WebSocket):
                     async for msg in aws_ws:
                         if msg.type == aiohttp.WSMsgType.BINARY:
                             for event in parser.parse(msg.data):
-                                etype = event.get('type')
-                                if etype != 'TranscriptEvent':
+                                etype = event.get("type")
+                                if etype != "TranscriptEvent":
                                     logger.error(f"AWS non-transcript event: type={etype} headers={event.get('headers')} payload={event.get('payload')}")
                                     continue
 
@@ -305,7 +304,7 @@ async def client_transcribe(ws: WebSocket):
                                     if detected_language == "en-US":
                                         english_text = original_text
                                     else:
-                                        # Translate from detected family (zh for zh-HK/zh-TW)
+                                        # translate from detected Chinese dialect
                                         source_lang = detected_language.split('-')[0]
                                         translation_response_en = translate.translate_text(
                                             Text=original_text,
@@ -378,11 +377,11 @@ def generate_note_from_scratch(comprehend_json: dict, full_transcript: str):
 ```json
 {
   "Chief Complaint": [{"text": "Fatigue"}],
-  "History of Present Illness": "The patient is a 45-year-old female presenting with a two-month history of progressive physical exhaustion. She feels drained upon waking and experiences worsening fatigue in the afternoons. This is associated with new-onset headaches and shortness of breath on exertion.",
+  "History of Present Illness": "The patient is a 45-year-old female with a two-month history of progressive physical exhaustion. She feels drained upon waking and experiences worsening fatigue in the afternoons. This is associated with new-onset headaches and shortness of breath on exertion.",
   "Pertinent Negatives": [{"text": "Patient denies dizziness, weight changes, changes in appetite, and fevers."}],
   "Past Medical History": [{"text": "Hypertension"}, {"text": "Family history of anemia"}],
   "Medications": [{"text": "Lisinopril 10mg daily"}, {"text": "Amlodipine 5mg daily"}],
-  "Assessment and Plan": "1. Fatigue and Shortness of Breath: The constellation of symptoms is concerning for iron deficiency anemia. Plan is to order blood work including a CBC and iron studies.\\n2. Hypertension Management: Patient's home medications seem effective. CONTINUE current regimen.\\n3. Patient Instructions: Advised to schedule a follow-up to review lab results in one week.\\n4. Red Flags: Instructed to seek urgent care for any new chest pain, severe shortness of breath, or fainting episodes."
+  "Assessment and Plan": "1. Fatigue and Shortness of Breath: The constellation of symptoms is concerning for iron deficiency anemia. Plan is to order blood work including a CBC and iron studies.\\n2. Hypertension Management: Patient's home medications seem effective; they should continue their current regimen.\\n3. Patient Instructions: Advised to schedule a follow-up to review lab results in one week.\\n4. Red Flags: Instructed to seek urgent care for any new chest pain, severe shortness of breath, or fainting episodes."
 }
 ```
 
@@ -390,11 +389,11 @@ def generate_note_from_scratch(comprehend_json: dict, full_transcript: str):
 ```json
 {
   "Chief Complaint": [{"text": "Fever and Rash"}],
-  "History of Present Illness": "The patient is a child presenting with a two-day history of low-grade fever and a red, blanching rash that appeared this morning on her chest and back. The mother notes the child has also had a mild runny nose and has been fussier than usual. The child remains active and is tolerating oral intake.",
+  "History of Present Illness": "The patient is a child with a two-day history of low-grade fever and a red, blanching rash that appeared this morning on her chest and back. The mother notes the child has also had a mild runny nose and has been fussier than usual. The child remains active and is tolerating oral intake.",
   "Pertinent Negatives": [{"text": "Patient's mother denies any cough, sore throat, vomiting, or diarrhea."}],
   "Past Medical History": [{"text": "Vaccinations are up to date."}],
   "Medications": [{"text": "None"}],
-  "Assessment and Plan": "1. Viral Exanthem: The constellation of low-grade fever, blanching rash, and mild URI symptoms in a well-appearing, vaccinated child is most consistent with a viral exanthem, such as roseola. The plan is to check vital signs, ensure good oxygen levels, and look in the throat and ears.\\n2. Patient Instructions: Advised to manage with supportive care including fluids, rest, and Tylenol as needed for fever.\\n3. Red Flags: If the rash turns purple or does not blanch, or if the patient develops a stiff neck, difficulty breathing, persistent high fever, or seems very lethargic, she should be brought in immediately or go to the ER."
+  "Assessment and Plan": "1. Viral Exanthem: The combination of low-grade fever, blanching rash, and mild URI symptoms in a well-appearing, vaccinated child is most consistent with a viral exanthem, such as roseola. The plan is to check vital signs, ensure good oxygen levels, and look in the throat and ears.\\n2. Patient Instructions: Advised to manage with supportive care including fluids, rest, and Tylenol as needed for fever.\\n3. Red Flags: If the rash turns purple or does not blanch, or if the patient develops a stiff neck, difficulty breathing, persistent high fever, or seems very lethargic, she should be brought in immediately or go to the ER."
 }
 ```
 
@@ -476,13 +475,13 @@ async def generate_final_note(payload: FinalNotePayload):
         raise HTTPException(status_code=400, detail="Received an empty transcript.")
     
     try:
-        # --- NEW: Check if the transcript needs translation ---
-        # A simple heuristic: if it contains Chinese characters.
+        # Check if the transcript has Chinese characters
+        # IF so, translate
         if re.search(r'[\u4e00-\u9fff]', payload.full_transcript):
             logger.info("Chinese transcript detected. Translating to English for processing...")
             translation_response = translate.translate_text(
                 Text=payload.full_transcript,
-                SourceLanguageCode='zh', # General Chinese is sufficient here
+                SourceLanguageCode='zh',
                 TargetLanguageCode='en'
             )
             english_transcript = translation_response['TranslatedText']
@@ -490,7 +489,7 @@ async def generate_final_note(payload: FinalNotePayload):
         else:
             english_transcript = payload.full_transcript
 
-        # --- The rest of the logic now uses the guaranteed-to-be-English transcript ---
+        # rst of the logic runs with assumption of a full English transcript
         logger.info("Running AWS Comprehend Medical on full English transcript...")
         result = comprehend_medical.detect_entities_v2(Text=english_transcript)
         all_entities = result.get('Entities', [])
@@ -501,10 +500,10 @@ async def generate_final_note(payload: FinalNotePayload):
             for e in all_entities
         ]
         
-        # This function now receives the English transcript
+        # recieving English transcript to generate note
         final_note = generate_note_from_scratch(simplified_entities, english_transcript)
 
-        # Post-processing functions remain the same
+        # post-processing functions
         structured_note = _fix_pertinent_negatives(final_note)
         normalized_note = _normalize_empty_sections(structured_note)
         formatted_note = _normalize_assessment_plan(normalized_note)
