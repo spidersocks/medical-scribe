@@ -22,6 +22,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 
+# Import modular prompts
+from prompts import get_prompt_generator
+
 # config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scribe-proxy")
@@ -51,8 +54,17 @@ comprehend_medical = boto3.client("comprehendmedical", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 translate = boto3.client("translate", region_name=AWS_REGION)
 
+class PatientInfo(BaseModel):
+    name: Optional[str] = None
+    sex: Optional[str] = None
+    age: Optional[str] = None
+    referring_physician: Optional[str] = None
+    additional_context: Optional[str] = None
+
 class FinalNotePayload(BaseModel):
     full_transcript: str
+    patient_info: Optional[PatientInfo] = None
+    note_type: str = "standard"  # New field for note type selection
 
 class CommandPayload(BaseModel):
     note_content: Dict[str, Any]
@@ -359,85 +371,6 @@ def _normalize_assessment_plan(note: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Passing through Assessment and Plan with minimal normalization.")
     return note
 
-# clinical note prompting
-def generate_note_from_scratch(comprehend_json: dict, full_transcript: str):
-    system_prompt = """You are an AI medical scribe with the reasoning ability of a senior clinician. Your task is to transform a conversation transcript into a perfectly structured, factually accurate clinical note in JSON format. Your response must be a single, valid JSON object and nothing else.
-
-**CORE PRINCIPIPLES:**
-1.  **DO NOT COPY FROM THE EXAMPLES:** The examples are for structure and style ONLY. Every single fact in your output (diagnoses, medications, history) MUST come from the user's transcript. Hallucinating information from the examples is a critical failure and must be avoided.
-2.  **NARRATIVE STYLE:** If age and gender are known, begin the HPI with "The patient is a [age]-year-old [gender]...". If unknown, use "The patient..." and omit age/gender.
-3.  **Fact-Check for Consistency:** After generating the note, re-read the entire transcript and your note. The summary in the Assessment MUST be consistent with the HPI. A symptom confirmed as positive in the HPI cannot be denied in the Pertinent Negatives.
-4.  **STRICT FORMATTING FOR NEGATIVES:** The "Pertinent Negatives" section is for denied symptoms ONLY. The value for this key MUST BE a JSON array of objects, each with a "text" key. FOR EXAMPLE: `[{"text": "Patient denies fevers"}, {"text": "Patient denies chills"}]`. IT MUST NOT BE A SINGLE STRING.
-5.  **Handle History and Medications Correctly:**
-    -   **Past Medical History:** List all medical conditions mentioned in the transcript, even if they seem minor (e.g., 'back pain').
-    -   **Medications:** This section is for pre-existing home medications. Include dosage and frequency if mentioned (e.g., "Ibuprofen 3-4 times a week"). If none, state "None".
-6.  **Be Comprehensive & CONSOLIDATED:** The note must be complete. For the Assessment and Plan, group related items (diagnostics, treatments, counseling) under a single diagnosis or problem number whenever possible, as shown in the examples.
-
-**"GOLD STANDARD" EXAMPLE 1: ADULT PRIMARY CARE**
-```json
-{
-  "Chief Complaint": [{"text": "Fatigue"}],
-  "History of Present Illness": "The patient is a 45-year-old female with a two-month history of progressive physical exhaustion. She feels drained upon waking and experiences worsening fatigue in the afternoons. This is associated with new-onset headaches and shortness of breath on exertion.",
-  "Pertinent Negatives": [{"text": "Patient denies dizziness, weight changes, changes in appetite, and fevers."}],
-  "Past Medical History": [{"text": "Hypertension"}, {"text": "Family history of anemia"}],
-  "Medications": [{"text": "Lisinopril 10mg daily"}, {"text": "Amlodipine 5mg daily"}],
-  "Assessment and Plan": "1. Fatigue and Shortness of Breath: The constellation of symptoms is concerning for iron deficiency anemia. Plan is to order blood work including a CBC and iron studies.\\n2. Hypertension Management: Patient's home medications seem effective; they should continue their current regimen.\\n3. Patient Instructions: Advised to schedule a follow-up to review lab results in one week.\\n4. Red Flags: Instructed to seek urgent care for any new chest pain, severe shortness of breath, or fainting episodes."
-}
-```
-
-**"GOLD STANDARD" EXAMPLE 2: PEDIATRIC ACUTE VISIT**
-```json
-{
-  "Chief Complaint": [{"text": "Fever and Rash"}],
-  "History of Present Illness": "The patient is a child with a two-day history of low-grade fever and a red, blanching rash that appeared this morning on her chest and back. The mother notes the child has also had a mild runny nose and has been fussier than usual. The child remains active and is tolerating oral intake.",
-  "Pertinent Negatives": [{"text": "Patient's mother denies any cough, sore throat, vomiting, or diarrhea."}],
-  "Past Medical History": [{"text": "Vaccinations are up to date."}],
-  "Medications": [{"text": "None"}],
-  "Assessment and Plan": "1. Viral Exanthem: The combination of low-grade fever, blanching rash, and mild URI symptoms in a well-appearing, vaccinated child is most consistent with a viral exanthem, such as roseola. The plan is to check vital signs, ensure good oxygen levels, and look in the throat and ears.\\n2. Patient Instructions: Advised to manage with supportive care including fluids, rest, and Tylenol as needed for fever.\\n3. Red Flags: If the rash turns purple or does not blanch, or if the patient develops a stiff neck, difficulty breathing, persistent high fever, or seems very lethargic, she should be brought in immediately or go to the ER."
-}
-```
-
-**YOUR TASK:**
-Now, using all the principles and the two "Gold Standard" examples above, generate a complete and accurate JSON note from the following transcript. For the Chief Complaint, use a concise clinical term that best represents the patient's main issue (e.g., "Abdominal Pain" instead of "stomach problem").
-"""
-
-    user_prompt = json.dumps({ "full_transcript": full_transcript, "comprehend_output": comprehend_json })
-    prompt = f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
-    body = json.dumps({"prompt": prompt, "max_tokens": 4096, "temperature": 0.1})
-
-    try:
-        response = bedrock_runtime.invoke_model(body=body, modelId="mistral.mistral-large-2402-v1:0", accept="application/json", contentType="application/json")
-        response_body = json.loads(response.get('body').read())
-        note_json_string = response_body.get('outputs')[0].get('text')
-        stop_reason = response_body.get('outputs')[0].get('stop_reason')
-
-        try:
-            start_index = note_json_string.find('{')
-            if start_index == -1: raise ValueError("Could not find a starting '{' in the model's response.")
-            json_substring = note_json_string[start_index:].strip()
-            brace_level = 0
-            last_brace_index = -1
-            for i, char in enumerate(json_substring):
-                if char == '{': brace_level += 1
-                elif char == '}':
-                    brace_level -= 1
-                    if brace_level == 0: last_brace_index = i
-            
-            if last_brace_index != -1: json_substring = json_substring[:last_brace_index + 1]
-            else:
-                if not json_substring.endswith('}'): json_substring += '}'
-
-            parsed_json = json.loads(json_substring)
-            return parsed_json
-            
-        except (ValueError, json.JSONDecodeError) as e:
-            error_message = f"Failed to parse JSON from final note. Stop Reason: {stop_reason}. Details: {e}. Full Generation: '{note_json_string}'"
-            raise ValueError(error_message)
-
-    except Exception as e:
-        if isinstance(e, ValueError): raise e
-        raise ValueError(f"An unexpected error occurred during Bedrock invocation. Details: {str(e)}")
-
 def _fix_pertinent_negatives(note: Dict[str, Any]) -> Dict[str, Any]:
     pn_section = note.get("Pertinent Negatives")
     if isinstance(pn_section, str):
@@ -454,7 +387,8 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
     for section in sections_to_check:
         items = note.get(section)
         text_to_check = ""
-        if isinstance(items, str): text_to_check = items.lower()
+        if isinstance(items, str): 
+            text_to_check = items.lower()
         elif isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
             text_to_check = items[0].get("text", "").lower().strip().lstrip('-').strip()
 
@@ -467,12 +401,113 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
                 note[section] = "None"
     return note
 
+# clinical note prompting - now modular!
+def generate_note_from_scratch(
+    comprehend_json: dict, 
+    full_transcript: str, 
+    patient_info: Optional[dict] = None, 
+    note_type: str = "standard"
+):
+    """
+    Generate a clinical note using the modular prompt system.
+    
+    Args:
+        comprehend_json: Medical entities extracted from the transcript
+        full_transcript: The full conversation transcript
+        patient_info: Optional patient demographic and context information
+        note_type: The type of note to generate (e.g., "standard", "soap")
+    
+    Returns:
+        Dict containing the structured clinical note
+    """
+    try:
+        # Get the appropriate prompt generator
+        prompt_module = get_prompt_generator(note_type)
+        logger.info(f"Generating {prompt_module.NOTE_TYPE} using modular prompt system")
+        
+        # Generate the system prompt using the selected module
+        system_prompt = prompt_module.generate_prompt(patient_info)
+        
+    except ValueError as e:
+        logger.error(f"Invalid note type requested: {note_type}")
+        raise ValueError(f"Invalid note type: {note_type}. Please use a valid note type.")
+    
+    user_prompt = json.dumps({ "full_transcript": full_transcript, "comprehend_output": comprehend_json })
+    prompt = f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
+    body = json.dumps({"prompt": prompt, "max_tokens": 4096, "temperature": 0.1})
+
+    try:
+        response = bedrock_runtime.invoke_model(
+            body=body, 
+            modelId="mistral.mistral-large-2402-v1:0", 
+            accept="application/json", 
+            contentType="application/json"
+        )
+        response_body = json.loads(response.get('body').read())
+        note_json_string = response_body.get('outputs')[0].get('text')
+        stop_reason = response_body.get('outputs')[0].get('stop_reason')
+
+        try:
+            start_index = note_json_string.find('{')
+            if start_index == -1: 
+                raise ValueError("Could not find a starting '{' in the model's response.")
+            json_substring = note_json_string[start_index:].strip()
+            
+            # Remove markdown code fences if present
+            if json_substring.startswith('```'):
+                lines = json_substring.split('\n')
+                json_substring = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+            
+            brace_level = 0
+            last_brace_index = -1
+            for i, char in enumerate(json_substring):
+                if char == '{': brace_level += 1
+                elif char == '}':
+                    brace_level -= 1
+                    if brace_level == 0: last_brace_index = i
+            
+            if last_brace_index != -1: 
+                json_substring = json_substring[:last_brace_index + 1]
+            else:
+                if not json_substring.endswith('}'): 
+                    json_substring += '}'
+
+            # Attempt to fix common JSON errors
+            json_substring = re.sub(r'"text:\s*"', '"text": "', json_substring)
+            json_substring = re.sub(r'"(\w+):\s*', r'"\1": ', json_substring)
+
+            parsed_json = json.loads(json_substring)
+            logger.info(f"Successfully generated {note_type} note with {len(parsed_json)} sections")
+            return parsed_json
+            
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.warning(f"First JSON parse attempt failed: {e}. Attempting repair...")
+            try:
+                # More aggressive repair
+                repaired = json_substring
+                repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
+                repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
+                
+                parsed_json = json.loads(repaired)
+                logger.info("Successfully repaired and parsed JSON after initial failure")
+                return parsed_json
+            except Exception as repair_error:
+                error_message = f"Failed to parse JSON from final note even after repair. Stop Reason: {stop_reason}. Original error: {e}. Repair error: {repair_error}. Full Generation: '{note_json_string}'"
+                raise ValueError(error_message)
+
+    except Exception as e:
+        if isinstance(e, ValueError): raise e
+        raise ValueError(f"An unexpected error occurred during Bedrock invocation. Details: {str(e)}")
 
 @app.post("/generate-final-note")
 async def generate_final_note(payload: FinalNotePayload):
-    logger.info(f"Received full transcript for final note generation. Size: {len(payload.full_transcript)} chars.")
+    logger.info(f"Received full transcript for final note generation. Size: {len(payload.full_transcript)} chars. Note type: {payload.note_type}")
     if not payload.full_transcript.strip():
         raise HTTPException(status_code=400, detail="Received an empty transcript.")
+    
+    # Log patient information if provided
+    if payload.patient_info:
+        logger.info(f"Patient information provided: {payload.patient_info.model_dump(exclude_none=True)}")
     
     try:
         # Check if the transcript has Chinese characters
@@ -489,7 +524,7 @@ async def generate_final_note(payload: FinalNotePayload):
         else:
             english_transcript = payload.full_transcript
 
-        # rst of the logic runs with assumption of a full English transcript
+        # rest of the logic runs with assumption of a full English transcript
         logger.info("Running AWS Comprehend Medical on full English transcript...")
         result = comprehend_medical.detect_entities_v2(Text=english_transcript)
         all_entities = result.get('Entities', [])
@@ -500,20 +535,33 @@ async def generate_final_note(payload: FinalNotePayload):
             for e in all_entities
         ]
         
-        # recieving English transcript to generate note
-        final_note = generate_note_from_scratch(simplified_entities, english_transcript)
+        # Convert patient_info to dict if present
+        patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
+        
+        # Generate note using modular prompt system with selected note type
+        final_note = generate_note_from_scratch(
+            simplified_entities, 
+            english_transcript, 
+            patient_info_dict,
+            note_type=payload.note_type
+        )
 
-        # post-processing functions
-        structured_note = _fix_pertinent_negatives(final_note)
-        normalized_note = _normalize_empty_sections(structured_note)
-        formatted_note = _normalize_assessment_plan(normalized_note)
+        # Post-processing functions (only apply to standard notes)
+        # For other note types, these may not be applicable
+        if payload.note_type == "standard":
+            structured_note = _fix_pertinent_negatives(final_note)
+            normalized_note = _normalize_empty_sections(structured_note)
+            formatted_note = _normalize_assessment_plan(normalized_note)
+        else:
+            # For other note types, return as-is
+            formatted_note = final_note
 
         return {"notes": formatted_note}
     except Exception as e:
         logger.error(f"Error during final note generation endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# new execute command endpoint
+# execute command endpoint
 @app.post("/execute-command")
 async def execute_command(payload: CommandPayload):
     if not payload.command.strip():
@@ -534,7 +582,12 @@ For example, if the command is "Write a referral letter to a cardiologist", you 
     body = json.dumps({"prompt": prompt, "max_tokens": 2048, "temperature": 0.2})
     
     try:
-        response = bedrock_runtime.invoke_model(body=body, modelId="mistral.mistral-large-2402-v1:0", accept="application/json", contentType="application/json")
+        response = bedrock_runtime.invoke_model(
+            body=body, 
+            modelId="mistral.mistral-large-2402-v1:0", 
+            accept="application/json", 
+            contentType="application/json"
+        )
         response_body = json.loads(response.get('body').read())
         result_text = response_body.get('outputs')[0].get('text').strip()
         
@@ -546,6 +599,21 @@ For example, if the command is "Write a referral letter to a cardiologist", you 
         logger.error(f"Error during command execution: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
 
+# Endpoint to list available note types
+@app.get("/note-types")
+async def get_note_types():
+    """Return a list of available note types that can be generated."""
+    from prompts import PROMPT_REGISTRY
+    
+    note_types = []
+    for key, module in PROMPT_REGISTRY.items():
+        note_types.append({
+            "id": key,
+            "name": module.NOTE_TYPE,
+            "description": f"Generate a {module.NOTE_TYPE}"
+        })
+    
+    return {"note_types": note_types}
 
 # on run...
 if __name__ == "__main__":
