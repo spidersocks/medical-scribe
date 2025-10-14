@@ -1,0 +1,74 @@
+ASCII Directory Tree for the backend (medical-scribe)
+
+medical-scribe/
+├── .env
+├── .gitignore
+├── alembic.ini
+├── api/
+│   ├── __init__.py
+│   ├── deps.py
+│   └── v1/
+│       ├── __init__.py
+│       ├── clinical_notes.py
+│       ├── consultations.py
+│       ├── patients.py
+│       ├── transcript_segments.py
+│       └── users.py
+├── database.py
+├── main.py
+├── models.py
+├── README.md
+├── repositories/
+│   ├── __init__.py
+│   ├── clinical_note.py
+│   ├── consultation.py
+│   ├── patient.py
+│   ├── transcript_segment.py
+│   └── user.py
+├── requirements.txt
+├── schemas/
+│   ├── __init__.py
+│   ├── clinical_note.py
+│   ├── consultation.py
+│   ├── patient.py
+│   ├── transcript_segment.py
+│   └── user.py
+├── services/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── clinical_note.py
+│   ├── consultation.py
+│   ├── exceptions.py
+│   ├── patient.py
+│   ├── transcript_segment.py
+│   └── user.py
+├── venv/
+│   └── (virtual environment files and site-packages)
+├── migrations/
+│   ├── README
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       └── a8cf9d2e33bd_initial_schema.py
+└── prompts/
+    ├── __init__.py
+    ├── base.py
+    └── note_generators/
+        ├── __init__.py
+        ├── consultation_note.py
+        ├── hp_note.py
+        ├── soap_note.py
+        └── standard_note.py
+
+Notes:
+
+- The backend now exposes a versioned REST interface under `api/v1`, layered on top of services and repositories.
+  - `api/deps.py` centralizes database session management and translates service exceptions into HTTP errors.
+  - Individual routers (`users.py`, `patients.py`, etc.) handle HTTP wiring and delegate business logic to services.
+- `services/` encapsulates business rules, mapping Pydantic schemas to SQLAlchemy models while enforcing validation and transaction boundaries via reusable helpers in `services/base.py`.
+- `repositories/` houses the CRUD data-access layer for each entity, keeping SQLAlchemy operations isolated from the rest of the stack.
+- `schemas/` contains Pydantic models for request/response payloads, mirroring the SQLAlchemy entities defined in `models.py`.
+- `main.py` still wires WebSocket transcription, note generation endpoints, and now includes the `api_router` for REST routes.
+- `database.py` provides the async SQLAlchemy engine/session setup (`async_sessionmaker`), supporting Alembic migrations in `migrations/`.
+- The modular prompt system (`prompts/`) continues to manage note generation types (Standard, SOAP, HP, Consultation).
+- Future schema changes should be applied through Alembic migrations (`alembic revision --autogenerate`, review, and `alembic upgrade head`) to keep the database synchronized with `models.py`.

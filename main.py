@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import hmac
 import hashlib
@@ -24,6 +22,7 @@ from starlette.websockets import WebSocketState
 
 # Import modular prompts
 from prompts import get_prompt_generator
+from api import api_router
 
 # config
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +48,8 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
     max_age=86400,  # cache preflight 1 day
 )
+
+app.include_router(api_router)
 
 comprehend_medical = boto3.client("comprehendmedical", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
@@ -401,6 +402,31 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
                 note[section] = "None"
     return note
 
+def _insert_missing_commas(raw_json: str) -> str:
+    """Best-effort insertion of missing commas between JSON key/value pairs."""
+    lines = raw_json.splitlines()
+    fixed_lines = []
+
+    for idx, line in enumerate(lines):
+        stripped_line = line.rstrip()
+        trimmed = stripped_line.strip()
+
+        if (
+            trimmed.startswith('"')
+            and ":" in trimmed
+            and not trimmed.endswith(",")
+        ):
+            next_trimmed = ""
+            for j in range(idx + 1, len(lines)):
+                next_trimmed = lines[j].strip()
+                if next_trimmed:
+                    break
+            if next_trimmed and not next_trimmed.startswith(("}", "]")):
+                stripped_line += ","
+        fixed_lines.append(stripped_line)
+
+    return "\n".join(fixed_lines)
+
 # clinical note prompting - now modular!
 def generate_note_from_scratch(
     comprehend_json: dict, 
@@ -484,7 +510,7 @@ def generate_note_from_scratch(
             logger.warning(f"First JSON parse attempt failed: {e}. Attempting repair...")
             try:
                 # More aggressive repair
-                repaired = json_substring
+                repaired = _insert_missing_commas(json_substring)
                 repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
                 repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
                 
