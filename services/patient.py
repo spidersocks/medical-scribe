@@ -1,98 +1,79 @@
 from __future__ import annotations
 
-from typing import List, Optional
-from uuid import UUID
+from typing import List
+from uuid import UUID, uuid4
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from botocore.exceptions import ClientError  # type: ignore
 
-from repositories import (
-    create_patient,
-    delete_patient,
-    get_patient,
-    get_patient_by_email_for_user,
-    list_patients_for_user,
-    update_patient,
-)
+from services.base import DynamoServiceMixin, run_in_thread
+from services.exceptions import NotFoundError
 from schemas.patient import (
     PatientCreate,
     PatientRead,
     PatientSummary,
     PatientUpdate,
 )
-from .base import ensure_condition, unwrap_or_raise
 
 
-class PatientService:
-    @staticmethod
-    async def create(session: AsyncSession, payload: PatientCreate) -> PatientRead:
-        if payload.email:
-            existing = await get_patient_by_email_for_user(
-                session,
-                user_id=payload.user_id,
-                email=payload.email,
-            )
-            ensure_condition(existing is None, "Patient email already exists for this clinician.")
-        patient = await create_patient(session, payload)
-        return PatientRead.from_orm(patient)
+class PatientService(DynamoServiceMixin):
+    async def create(self, payload: PatientCreate) -> PatientRead:
+        data = payload.model_dump()
+        raw_id = data.pop("id", None)
+        patient_id = str(raw_id or uuid4())
+        item = {"id": patient_id, **self.serialize_input(data)}
+        await run_in_thread(self.table.put_item, Item=item)
+        clean_item = self.clean(item)
+        return PatientRead.model_validate(clean_item)
 
-    @staticmethod
-    async def get(
-        session: AsyncSession,
-        patient_id: UUID,
-        *,
-        include_consultations: bool = False,
-    ) -> PatientRead:
-        patient = unwrap_or_raise(
-            await get_patient(
-                session,
-                patient_id,
-                include_consultations=include_consultations,
-            ),
-            resource_name="Patient",
-        )
-        return PatientRead.from_orm(patient)
-
-    @staticmethod
     async def list_for_user(
-        session: AsyncSession,
-        user_id: UUID,
+        self,
+        user_id: str | UUID,
         *,
         limit: int = 100,
         offset: int = 0,
         starred_only: bool = False,
         summary: bool = False,
-    ) -> List[PatientSummary | PatientRead]:
-        patients = await list_patients_for_user(
-            session,
-            user_id=user_id,
-            limit=limit,
-            offset=offset,
-            starred_only=starred_only,
-        )
+    ) -> List[PatientSummary] | List[PatientRead]:
+        user_id_str = str(user_id)
+        items = await self.scan_all()
+        filtered = [
+            item
+            for item in items
+            if str(item.get("user_id")) == user_id_str
+            and (not starred_only or bool(item.get("starred")))
+        ]
+        paginated = filtered[offset : offset + limit]
         if summary:
-            return [PatientSummary.from_orm(p) for p in patients]
-        return [PatientRead.from_orm(p) for p in patients]
+            return [PatientSummary.model_validate(item) for item in paginated]
+        return [PatientRead.model_validate(item) for item in paginated]
 
-    @staticmethod
-    async def update(
-        session: AsyncSession,
-        patient_id: UUID,
-        payload: PatientUpdate,
-    ) -> PatientRead:
-        patient = unwrap_or_raise(await get_patient(session, patient_id), resource_name="Patient")
+    async def get(self, patient_id: str | UUID) -> PatientRead:
+        item = await self.get_required_item(str(patient_id))
+        return PatientRead.model_validate(item)
 
-        if payload.email and payload.email != patient.email:
-            existing = await get_patient_by_email_for_user(
-                session,
-                user_id=patient.user_id,
-                email=payload.email,
+    async def update(self, patient_id: str | UUID, payload: PatientUpdate) -> PatientRead:
+        existing = await self.get_required_item(str(patient_id))
+        updates = payload.model_dump(exclude_unset=True)
+        merged = {**existing, **self.serialize_input(updates)}
+        await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
+        clean_item = self.clean(merged)
+        return PatientRead.model_validate(clean_item)
+
+    async def delete(self, patient_id: str | UUID) -> None:
+        try:
+            await run_in_thread(
+                self.table.delete_item,
+                Key={self.partition_key: str(patient_id)},
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames={"#pk": self.partition_key},
             )
-            ensure_condition(existing is None, "Patient email already exists for this clinician.")
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise NotFoundError(f"Patient with id={patient_id} was not found.") from exc
+            raise
 
-        patient = await update_patient(session, patient, payload)
-        return PatientRead.from_orm(patient)
 
-    @staticmethod
-    async def delete(session: AsyncSession, patient_id: UUID) -> None:
-        patient = unwrap_or_raise(await get_patient(session, patient_id), resource_name="Patient")
-        await delete_patient(session, patient)
+patient_service = PatientService(
+    table_env_name="PATIENTS_TABLE_NAME",
+    default_table_name="medical-scribe-patients",
+)

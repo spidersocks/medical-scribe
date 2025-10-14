@@ -1,58 +1,88 @@
-from __future__ import annotations
+import asyncio
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any, Callable, Coroutine, Dict, List, TypeVar
+from uuid import UUID
 
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Callable, Coroutine, TypeVar
+from boto3.dynamodb.conditions import Key  # type: ignore
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from .exceptions import ServiceError
+from services.exceptions import NotFoundError, ValidationError
 
 T = TypeVar("T")
 
 
-@asynccontextmanager
-async def transactional_session(session: AsyncSession) -> AsyncIterator[AsyncSession]:
-    """
-    Helper context manager for manual transaction boundaries.
-    Usage:
-        async with transactional_session(session) as tx:
-            ...
-    """
-    try:
-        yield session
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise
+def serialize_for_dynamo(value: Any) -> Any:
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, list):
+        return [serialize_for_dynamo(item) for item in value]
+    if isinstance(value, dict):
+        return {key: serialize_for_dynamo(val) for key, val in value.items()}
+    return value
 
 
-async def run_in_transaction(
-    session: AsyncSession,
-    func: Callable[[AsyncSession], Coroutine[None, None, T]],
-) -> T:
-    """
-    Execute a coroutine with automatic commit/rollback.
-    """
-    async with transactional_session(session) as tx:
-        return await func(tx)
+def clean_from_dynamo(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return int(value) if value % 1 == 0 else float(value)
+    if isinstance(value, list):
+        return [clean_from_dynamo(item) for item in value]
+    if isinstance(value, dict):
+        return {key: clean_from_dynamo(val) for key, val in value.items()}
+    return value
 
 
-def unwrap_or_raise(obj, *, resource_name: str):
-    """
-    Convenience helper to convert None into a NotFoundError.
-    """
-    if obj is None:
-        from .exceptions import NotFoundError
-
-        raise NotFoundError(f"{resource_name} not found.")
-    return obj
+def run_in_thread(func: Callable[..., T], *args, **kwargs) -> Coroutine[Any, Any, T]:
+    return asyncio.to_thread(func, *args, **kwargs)
 
 
-def ensure_condition(condition: bool, message: str):
-    """
-    Raise ValidationError if condition is False.
-    """
-    if not condition:
-        from .exceptions import ValidationError
+@dataclass
+class DynamoServiceMixin:
+    table_env_name: str
+    default_table_name: str
+    partition_key: str = "id"
 
-        raise ValidationError(message)
+    @property
+    def table(self):
+        from data.dynamodb import get_table  # local import to avoid circular deps
+
+        return get_table(self.table_env_name, self.default_table_name)
+
+    def serialize_input(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: serialize_for_dynamo(value) for key, value in data.items()}
+
+    def clean(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: clean_from_dynamo(value) for key, value in item.items()}
+
+    async def scan_all(self) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        response = await run_in_thread(self.table.scan)
+        items.extend(response.get("Items", []))
+
+        while "LastEvaluatedKey" in response:
+            response = await run_in_thread(
+                self.table.scan,
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            items.extend(response.get("Items", []))
+
+        return [self.clean(item) for item in items]
+
+    async def get_required_item(self, item_id: str) -> Dict[str, Any]:
+        response = await run_in_thread(
+            self.table.get_item,
+            Key={self.partition_key: item_id},
+        )
+        item = response.get("Item")
+        if not item:
+            raise NotFoundError(f"{self.__class__.__name__} with id={item_id} was not found.")
+        return self.clean(item)
+
+    async def ensure_unique(self, index_name: str, value: str, message: str) -> None:
+        response = await run_in_thread(
+            self.table.query,
+            IndexName=index_name,
+            KeyConditionExpression=Key(index_name).eq(value),  # type: ignore[arg-type]
+            Limit=1,
+        )
+        if response.get("Items"):
+            raise ValidationError(message)

@@ -1,10 +1,10 @@
 class ServiceError(Exception):
-    """Base class for predictable service-layer exceptions."""
-
-
-class NotFoundError(ServiceError):
-    """Raised when the requested resource does not exist."""
+    """Generic service-layer error."""
 
 
 class ValidationError(ServiceError):
-    """Raised when business rules are violated."""
+    """Raised when input data fails validation rules."""
+
+
+class NotFoundError(ServiceError):
+    """Raised when an entity cannot be found."""

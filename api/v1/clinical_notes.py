@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Response, status
 
-from api.deps import guard_service, get_session
+from api.deps import guard_service
 from schemas.clinical_note import (
     ClinicalNoteCreate,
     ClinicalNoteRead,
     ClinicalNoteUpdate,
 )
-from services import ClinicalNoteService
+from services import clinical_note_service
 
 router = APIRouter()
 
@@ -24,10 +23,9 @@ router = APIRouter()
 async def create_clinical_note(
     consultation_id: UUID,
     payload: ClinicalNoteCreate,
-    session: AsyncSession = Depends(get_session),
 ) -> ClinicalNoteRead:
-    payload = payload.copy(update={"consultation_id": consultation_id})
-    return await guard_service(ClinicalNoteService.create(session, payload))
+    payload_with_consultation = payload.copy(update={"consultation_id": str(consultation_id)})
+    return await guard_service(clinical_note_service.create(payload_with_consultation))
 
 
 @router.get(
@@ -36,10 +34,9 @@ async def create_clinical_note(
 )
 async def get_clinical_note_for_consultation(
     consultation_id: UUID,
-    session: AsyncSession = Depends(get_session),
 ) -> ClinicalNoteRead:
     return await guard_service(
-        ClinicalNoteService.get_by_consultation(session, consultation_id)
+        clinical_note_service.get_by_consultation(str(consultation_id))
     )
 
 
@@ -50,34 +47,28 @@ async def get_clinical_note_for_consultation(
 async def upsert_clinical_note_for_consultation(
     consultation_id: UUID,
     payload: ClinicalNoteUpdate,
-    session: AsyncSession = Depends(get_session),
 ) -> ClinicalNoteRead:
     return await guard_service(
-        ClinicalNoteService.upsert(session, consultation_id, payload)
+        clinical_note_service.upsert(str(consultation_id), payload)
     )
 
 
 @router.get("/clinical-notes/{note_id}", response_model=ClinicalNoteRead)
-async def get_clinical_note(
-    note_id: UUID,
-    session: AsyncSession = Depends(get_session),
-) -> ClinicalNoteRead:
-    return await guard_service(ClinicalNoteService.get(session, note_id))
+async def get_clinical_note(note_id: UUID) -> ClinicalNoteRead:
+    return await guard_service(clinical_note_service.get(str(note_id)))
 
 
 @router.patch("/clinical-notes/{note_id}", response_model=ClinicalNoteRead)
 async def update_clinical_note(
     note_id: UUID,
     payload: ClinicalNoteUpdate,
-    session: AsyncSession = Depends(get_session),
 ) -> ClinicalNoteRead:
-    return await guard_service(ClinicalNoteService.update(session, note_id, payload))
+    return await guard_service(
+        clinical_note_service.update(str(note_id), payload)
+    )
 
 
 @router.delete("/clinical-notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_clinical_note(
-    note_id: UUID,
-    session: AsyncSession = Depends(get_session),
-) -> Response:
-    await guard_service(ClinicalNoteService.delete(session, note_id))
+async def delete_clinical_note(note_id: UUID) -> Response:
+    await guard_service(clinical_note_service.delete(str(note_id)))
     return Response(status_code=status.HTTP_204_NO_CONTENT)

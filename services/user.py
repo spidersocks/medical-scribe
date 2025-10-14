@@ -1,49 +1,57 @@
 from __future__ import annotations
 
 from typing import List
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from botocore.exceptions import ClientError  # type: ignore
 
-from repositories import (
-    create_user,
-    delete_user,
-    get_user,
-    get_user_by_email,
-    list_users,
-    update_user,
-)
+from services.base import DynamoServiceMixin, run_in_thread
+from services.exceptions import NotFoundError
 from schemas.user import UserCreate, UserRead, UserUpdate
-from .base import unwrap_or_raise
-from .exceptions import ValidationError
 
 
-class UserService:
-    @staticmethod
-    async def create(session: AsyncSession, payload: UserCreate) -> UserRead:
-        existing = await get_user_by_email(session, payload.email)
-        if existing:
-            raise ValidationError("A user with this email already exists.")
-        user = await create_user(session, payload)
-        return UserRead.from_orm(user)
+class UserService(DynamoServiceMixin):
+    async def create(self, payload: UserCreate) -> UserRead:
+        data = payload.model_dump()
+        raw_id = data.pop("id", None)
+        user_id = str(raw_id or uuid4())
+        item = {"id": user_id, **self.serialize_input(data)}
+        await run_in_thread(self.table.put_item, Item=item)
+        clean_item = self.clean(item)
+        return UserRead.model_validate(clean_item)
 
-    @staticmethod
-    async def get(session: AsyncSession, user_id: UUID) -> UserRead:
-        user = unwrap_or_raise(await get_user(session, user_id), resource_name="User")
-        return UserRead.from_orm(user)
+    async def list(self, limit: int = 100, offset: int = 0) -> List[UserRead]:
+        items = await self.scan_all()
+        paginated = items[offset : offset + limit]
+        return [UserRead.model_validate(item) for item in paginated]
 
-    @staticmethod
-    async def list(session: AsyncSession, limit: int = 100, offset: int = 0) -> List[UserRead]:
-        users = await list_users(session, limit=limit, offset=offset)
-        return [UserRead.from_orm(u) for u in users]
+    async def get(self, user_id: str | UUID) -> UserRead:
+        item = await self.get_required_item(str(user_id))
+        return UserRead.model_validate(item)
 
-    @staticmethod
-    async def update(session: AsyncSession, user_id: UUID, payload: UserUpdate) -> UserRead:
-        user = unwrap_or_raise(await get_user(session, user_id), resource_name="User")
-        user = await update_user(session, user, payload)
-        return UserRead.from_orm(user)
+    async def update(self, user_id: str | UUID, payload: UserUpdate) -> UserRead:
+        existing = await self.get_required_item(str(user_id))
+        updates = payload.model_dump(exclude_unset=True)
+        merged = {**existing, **self.serialize_input(updates)}
+        await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
+        clean_item = self.clean(merged)
+        return UserRead.model_validate(clean_item)
 
-    @staticmethod
-    async def delete(session: AsyncSession, user_id: UUID) -> None:
-        user = unwrap_or_raise(await get_user(session, user_id), resource_name="User")
-        await delete_user(session, user)
+    async def delete(self, user_id: str | UUID) -> None:
+        try:
+            await run_in_thread(
+                self.table.delete_item,
+                Key={self.partition_key: str(user_id)},
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames={"#pk": self.partition_key},
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise NotFoundError(f"User with id={user_id} was not found.") from exc
+            raise
+
+
+user_service = UserService(
+    table_env_name="USERS_TABLE_NAME",
+    default_table_name="medical-scribe-users",
+)

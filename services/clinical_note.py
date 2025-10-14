@@ -1,82 +1,100 @@
 from __future__ import annotations
 
-from uuid import UUID
+from typing import Optional
+from uuid import UUID, uuid4
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from botocore.exceptions import ClientError  # type: ignore
 
-from repositories import (
-    create_clinical_note,
-    delete_clinical_note,
-    get_clinical_note,
-    get_clinical_note_by_consultation,
-    get_consultation,
-    update_clinical_note,
+from services.base import DynamoServiceMixin, run_in_thread
+from services.exceptions import NotFoundError, ValidationError
+from schemas.clinical_note import (
+    ClinicalNoteCreate,
+    ClinicalNoteRead,
+    ClinicalNoteUpdate,
 )
-from schemas.clinical_note import ClinicalNoteCreate, ClinicalNoteRead, ClinicalNoteUpdate
-from .base import ensure_condition, unwrap_or_raise
-from .exceptions import ValidationError
 
 
-class ClinicalNoteService:
-    @staticmethod
-    async def create(session: AsyncSession, payload: ClinicalNoteCreate) -> ClinicalNoteRead:
-        consultation = unwrap_or_raise(
-            await get_consultation(session, payload.consultation_id),
-            resource_name="Consultation",
-        )
-        existing = await get_clinical_note_by_consultation(session, payload.consultation_id)
-        ensure_condition(existing is None, "Consultation already has a clinical note.")
-        note = await create_clinical_note(session, payload)
-        return ClinicalNoteRead.from_orm(note)
+class ClinicalNoteService(DynamoServiceMixin):
+    async def create(self, payload: ClinicalNoteCreate) -> ClinicalNoteRead:
+        data = payload.model_dump()
+        consultation_id = data.get("consultation_id")
+        if not consultation_id:
+            raise ValidationError("consultation_id is required to create a clinical note.")
+        consultation_id_str = str(consultation_id)
 
-    @staticmethod
-    async def get(session: AsyncSession, note_id: UUID) -> ClinicalNoteRead:
-        note = unwrap_or_raise(
-            await get_clinical_note(session, note_id),
-            resource_name="ClinicalNote",
-        )
-        return ClinicalNoteRead.from_orm(note)
+        existing = await self.try_get_by_consultation(consultation_id_str)
+        if existing:
+            raise ValidationError("A clinical note already exists for this consultation.")
 
-    @staticmethod
-    async def get_by_consultation(session: AsyncSession, consultation_id: UUID) -> ClinicalNoteRead:
-        note = unwrap_or_raise(
-            await get_clinical_note_by_consultation(session, consultation_id),
-            resource_name="ClinicalNote",
-        )
-        return ClinicalNoteRead.from_orm(note)
+        raw_id = data.pop("id", None)
+        note_id = str(raw_id or uuid4())
+        item = {"id": note_id, "consultation_id": consultation_id_str, **self.serialize_input(data)}
+        await run_in_thread(self.table.put_item, Item=item)
+        clean_item = self.clean(item)
+        return ClinicalNoteRead.model_validate(clean_item)
 
-    @staticmethod
-    async def upsert(
-        session: AsyncSession,
-        consultation_id: UUID,
+    async def get(self, note_id: str | UUID) -> ClinicalNoteRead:
+        item = await self.get_required_item(str(note_id))
+        return ClinicalNoteRead.model_validate(item)
+
+    async def get_by_consultation(self, consultation_id: str | UUID) -> ClinicalNoteRead:
+        note = await self.try_get_by_consultation(str(consultation_id))
+        if not note:
+            raise NotFoundError(f"No clinical note found for consultation {consultation_id}.")
+        return note
+
+    async def try_get_by_consultation(
+        self,
+        consultation_id: str | UUID,
+    ) -> Optional[ClinicalNoteRead]:
+        consultation_id_str = str(consultation_id)
+        items = await self.scan_all()
+        for item in items:
+            if str(item.get("consultation_id")) == consultation_id_str:
+                return ClinicalNoteRead.model_validate(item)
+        return None
+
+    async def update(
+        self,
+        note_id: str | UUID,
         payload: ClinicalNoteUpdate,
     ) -> ClinicalNoteRead:
-        note = await get_clinical_note_by_consultation(session, consultation_id)
-        if note is None:
-            ensure_condition(payload.content is not None, "Cannot create note without content.")
-            create_payload = ClinicalNoteCreate(
-                consultation_id=consultation_id,
-                note_type=payload.note_type or "standard",
-                content=payload.content,
+        existing = await self.get_required_item(str(note_id))
+        updates = payload.model_dump(exclude_unset=True)
+        merged = {**existing, **self.serialize_input(updates)}
+        await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
+        clean_item = self.clean(merged)
+        return ClinicalNoteRead.model_validate(clean_item)
+
+    async def upsert(
+        self,
+        consultation_id: str | UUID,
+        payload: ClinicalNoteUpdate,
+    ) -> ClinicalNoteRead:
+        existing = await self.try_get_by_consultation(str(consultation_id))
+        if existing:
+            return await self.update(existing.id, payload)  # type: ignore[attr-defined]
+
+        create_payload = ClinicalNoteCreate.model_validate(
+            {"consultation_id": str(consultation_id), **payload.model_dump()}
+        )
+        return await self.create(create_payload)
+
+    async def delete(self, note_id: str | UUID) -> None:
+        try:
+            await run_in_thread(
+                self.table.delete_item,
+                Key={self.partition_key: str(note_id)},
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames={"#pk": self.partition_key},
             )
-            note = await create_clinical_note(session, create_payload)
-        else:
-            note = await update_clinical_note(session, note, payload)
-        return ClinicalNoteRead.from_orm(note)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise NotFoundError(f"Clinical note with id={note_id} was not found.") from exc
+            raise
 
-    @staticmethod
-    async def update(session: AsyncSession, note_id: UUID, payload: ClinicalNoteUpdate) -> ClinicalNoteRead:
-        note = unwrap_or_raise(
-            await get_clinical_note(session, note_id),
-            resource_name="ClinicalNote",
-        )
-        note = await update_clinical_note(session, note, payload)
-        return ClinicalNoteRead.from_orm(note)
 
-    @staticmethod
-    async def delete(session: AsyncSession, note_id: UUID) -> None:
-        note = unwrap_or_raise(
-            await get_clinical_note(session, note_id),
-            resource_name="ClinicalNote",
-        )
-        await delete_clinical_note(session, note)
+clinical_note_service = ClinicalNoteService(
+    table_env_name="CLINICAL_NOTES_TABLE_NAME",
+    default_table_name="medical-scribe-clinical-notes",
+)

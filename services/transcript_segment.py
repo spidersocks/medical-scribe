@@ -1,82 +1,76 @@
 from __future__ import annotations
 
 from typing import List
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from botocore.exceptions import ClientError  # type: ignore
 
-from repositories import (
-    create_transcript_segment,
-    delete_transcript_segment,
-    delete_transcript_segments_for_consultation,
-    get_consultation,
-    get_transcript_segment,
-    list_transcript_segments_for_consultation,
-    update_transcript_segment,
-)
+from services.base import DynamoServiceMixin, run_in_thread
+from services.exceptions import NotFoundError
 from schemas.transcript_segment import (
     TranscriptSegmentCreate,
     TranscriptSegmentRead,
     TranscriptSegmentUpdate,
 )
-from .base import unwrap_or_raise
 
 
-class TranscriptSegmentService:
-    @staticmethod
-    async def create(session: AsyncSession, payload: TranscriptSegmentCreate) -> TranscriptSegmentRead:
-        unwrap_or_raise(
-            await get_consultation(session, payload.consultation_id),
-            resource_name="Consultation",
-        )
-        segment = await create_transcript_segment(session, payload)
-        return TranscriptSegmentRead.from_orm(segment)
-
-    @staticmethod
-    async def get(session: AsyncSession, segment_id: UUID) -> TranscriptSegmentRead:
-        segment = unwrap_or_raise(
-            await get_transcript_segment(session, segment_id),
-            resource_name="TranscriptSegment",
-        )
-        return TranscriptSegmentRead.from_orm(segment)
-
-    @staticmethod
+class TranscriptSegmentService(DynamoServiceMixin):
     async def list_for_consultation(
-        session: AsyncSession,
-        consultation_id: UUID,
+        self,
+        consultation_id: str | UUID,
     ) -> List[TranscriptSegmentRead]:
-        unwrap_or_raise(
-            await get_consultation(session, consultation_id),
-            resource_name="Consultation",
-        )
-        segments = await list_transcript_segments_for_consultation(session, consultation_id)
-        return [TranscriptSegmentRead.from_orm(s) for s in segments]
+        consultation_id_str = str(consultation_id)
+        items = await self.scan_all()
+        filtered = [
+            item
+            for item in items
+            if str(item.get("consultation_id")) == consultation_id_str
+        ]
+        return [TranscriptSegmentRead.model_validate(item) for item in filtered]
 
-    @staticmethod
+    async def create(
+        self,
+        payload: TranscriptSegmentCreate,
+    ) -> TranscriptSegmentRead:
+        data = payload.model_dump()
+        raw_id = data.pop("id", None)
+        segment_id = str(raw_id or uuid4())
+        item = {"id": segment_id, **self.serialize_input(data)}
+        await run_in_thread(self.table.put_item, Item=item)
+        clean_item = self.clean(item)
+        return TranscriptSegmentRead.model_validate(clean_item)
+
+    async def get(self, segment_id: str | UUID) -> TranscriptSegmentRead:
+        item = await self.get_required_item(str(segment_id))
+        return TranscriptSegmentRead.model_validate(item)
+
     async def update(
-        session: AsyncSession,
-        segment_id: UUID,
+        self,
+        segment_id: str | UUID,
         payload: TranscriptSegmentUpdate,
     ) -> TranscriptSegmentRead:
-        segment = unwrap_or_raise(
-            await get_transcript_segment(session, segment_id),
-            resource_name="TranscriptSegment",
-        )
-        segment = await update_transcript_segment(session, segment, payload)
-        return TranscriptSegmentRead.from_orm(segment)
+        existing = await self.get_required_item(str(segment_id))
+        updates = payload.model_dump(exclude_unset=True)
+        merged = {**existing, **self.serialize_input(updates)}
+        await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
+        clean_item = self.clean(merged)
+        return TranscriptSegmentRead.model_validate(clean_item)
 
-    @staticmethod
-    async def delete(session: AsyncSession, segment_id: UUID) -> None:
-        segment = unwrap_or_raise(
-            await get_transcript_segment(session, segment_id),
-            resource_name="TranscriptSegment",
-        )
-        await delete_transcript_segment(session, segment)
+    async def delete(self, segment_id: str | UUID) -> None:
+        try:
+            await run_in_thread(
+                self.table.delete_item,
+                Key={self.partition_key: str(segment_id)},
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames={"#pk": self.partition_key},
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise NotFoundError(f"Transcript segment with id={segment_id} was not found.") from exc
+            raise
 
-    @staticmethod
-    async def delete_for_consultation(session: AsyncSession, consultation_id: UUID) -> int:
-        unwrap_or_raise(
-            await get_consultation(session, consultation_id),
-            resource_name="Consultation",
-        )
-        return await delete_transcript_segments_for_consultation(session, consultation_id)
+
+transcript_segment_service = TranscriptSegmentService(
+    table_env_name="TRANSCRIPT_SEGMENTS_TABLE_NAME",
+    default_table_name="medical-scribe-transcript-segments",
+)

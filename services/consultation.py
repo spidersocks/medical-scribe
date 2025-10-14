@@ -1,104 +1,104 @@
 from __future__ import annotations
 
 from typing import List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from botocore.exceptions import ClientError  # type: ignore
 
-from repositories import (
-    create_consultation,
-    delete_consultation,
-    get_consultation,
-    get_patient,
-    list_consultations_for_user,
-    update_consultation,
-)
+from services.base import DynamoServiceMixin, run_in_thread
+from services.exceptions import NotFoundError
 from schemas.consultation import (
     ConsultationCreate,
     ConsultationRead,
     ConsultationSummary,
     ConsultationUpdate,
 )
-from .base import ensure_condition, unwrap_or_raise
 
 
-class ConsultationService:
-    @staticmethod
-    async def create(session: AsyncSession, payload: ConsultationCreate) -> ConsultationRead:
-        patient = unwrap_or_raise(
-            await get_patient(session, payload.patient_id),
-            resource_name="Patient",
-        )
-        ensure_condition(
-            patient.user_id == payload.user_id,
-            "Patient does not belong to this user.",
-        )
-        consultation = await create_consultation(session, payload)
-        return ConsultationRead.from_orm(consultation)
+class ConsultationService(DynamoServiceMixin):
+    async def create(self, payload: ConsultationCreate) -> ConsultationRead:
+        data = payload.model_dump()
+        raw_id = data.pop("id", None)
+        consultation_id = str(raw_id or uuid4())
+        item = {"id": consultation_id, **self.serialize_input(data)}
+        await run_in_thread(self.table.put_item, Item=item)
+        clean_item = self.clean(item)
+        return ConsultationRead.model_validate(clean_item)
 
-    @staticmethod
-    async def get(
-        session: AsyncSession,
-        consultation_id: UUID,
-        *,
-        include_patient: bool = False,
-        include_segments: bool = False,
-        include_clinical_note: bool = False,
-    ) -> ConsultationRead:
-        consultation = unwrap_or_raise(
-            await get_consultation(
-                session,
-                consultation_id,
-                include_patient=include_patient,
-                include_segments=include_segments,
-                include_clinical_note=include_clinical_note,
-            ),
-            resource_name="Consultation",
-        )
-        return ConsultationRead.from_orm(consultation)
-
-    @staticmethod
     async def list_for_user(
-        session: AsyncSession,
-        user_id: UUID,
+        self,
+        user_id: str | UUID,
         *,
-        patient_id: Optional[UUID] = None,
+        patient_id: Optional[str | UUID] = None,
+        limit: int = 100,
+        offset: int = 0,
+        summary: bool = True,
+    ) -> List[ConsultationSummary] | List[ConsultationRead]:
+        user_id_str = str(user_id)
+        patient_id_str = str(patient_id) if patient_id else None
+        items = await self.scan_all()
+        filtered = [
+            item
+            for item in items
+            if str(item.get("user_id")) == user_id_str
+            and (patient_id_str is None or str(item.get("patient_id")) == patient_id_str)
+        ]
+        paginated = filtered[offset : offset + limit]
+        if summary:
+            return [ConsultationSummary.model_validate(item) for item in paginated]
+        return [ConsultationRead.model_validate(item) for item in paginated]
+
+    async def list_for_patient(
+        self,
+        patient_id: str | UUID,
+        *,
         limit: int = 100,
         offset: int = 0,
         summary: bool = False,
-        include_patient: bool = False,
-    ) -> List[ConsultationSummary | ConsultationRead]:
-        consultations = await list_consultations_for_user(
-            session,
-            user_id=user_id,
-            patient_id=patient_id,
-            limit=limit,
-            offset=offset,
-            include_patient=include_patient,
-            include_segments=not summary,
-            include_clinical_note=not summary,
-        )
+    ) -> List[ConsultationSummary] | List[ConsultationRead]:
+        patient_id_str = str(patient_id)
+        items = await self.scan_all()
+        filtered = [
+            item
+            for item in items
+            if str(item.get("patient_id")) == patient_id_str
+        ]
+        paginated = filtered[offset : offset + limit]
         if summary:
-            return [ConsultationSummary.from_orm(c) for c in consultations]
-        return [ConsultationRead.from_orm(c) for c in consultations]
+            return [ConsultationSummary.model_validate(item) for item in paginated]
+        return [ConsultationRead.model_validate(item) for item in paginated]
 
-    @staticmethod
+    async def get(self, consultation_id: str | UUID) -> ConsultationRead:
+        item = await self.get_required_item(str(consultation_id))
+        return ConsultationRead.model_validate(item)
+
     async def update(
-        session: AsyncSession,
-        consultation_id: UUID,
+        self,
+        consultation_id: str | UUID,
         payload: ConsultationUpdate,
     ) -> ConsultationRead:
-        consultation = unwrap_or_raise(
-            await get_consultation(session, consultation_id),
-            resource_name="Consultation",
-        )
-        consultation = await update_consultation(session, consultation, payload)
-        return ConsultationRead.from_orm(consultation)
+        existing = await self.get_required_item(str(consultation_id))
+        updates = payload.model_dump(exclude_unset=True)
+        merged = {**existing, **self.serialize_input(updates)}
+        await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
+        clean_item = self.clean(merged)
+        return ConsultationRead.model_validate(clean_item)
 
-    @staticmethod
-    async def delete(session: AsyncSession, consultation_id: UUID) -> None:
-        consultation = unwrap_or_raise(
-            await get_consultation(session, consultation_id),
-            resource_name="Consultation",
-        )
-        await delete_consultation(session, consultation)
+    async def delete(self, consultation_id: str | UUID) -> None:
+        try:
+            await run_in_thread(
+                self.table.delete_item,
+                Key={self.partition_key: str(consultation_id)},
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames={"#pk": self.partition_key},
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                raise NotFoundError(f"Consultation with id={consultation_id} was not found.") from exc
+            raise
+
+
+consultation_service = ConsultationService(
+    table_env_name="CONSULTATIONS_TABLE_NAME",
+    default_table_name="medical-scribe-consultations",
+)
