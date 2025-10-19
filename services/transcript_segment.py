@@ -104,6 +104,10 @@ class TranscriptSegmentService(DynamoServiceMixin):
             }
             normalized.append(TranscriptSegmentRead.model_validate(data))
 
+        # IMPORTANT: return a list (sorted), not None
+        normalized.sort(key=lambda x: x.sequence_number)
+        return normalized
+
     async def create(
         self,
         payload: TranscriptSegmentCreate,
