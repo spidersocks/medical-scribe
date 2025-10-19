@@ -540,7 +540,10 @@ def register_routes(app: FastAPI) -> None:
         return {"note_types": response}
 
 
-# CORS: be explicit and robust
+def create_app() -> FastAPI:
+    app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
+
+    # CORS: be explicit and robust
     allowed = settings.allowed_origins or ["*"]
     allow_credentials = False if "*" in allowed else True
     logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
