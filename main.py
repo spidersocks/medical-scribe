@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
+from starlette.middleware.gzip import GZipMiddleware
 
 from prompts import PROMPT_REGISTRY, get_prompt_generator
 
@@ -30,7 +31,6 @@ except ImportError as exc:  # pragma: no cover
         "api_router could not be imported. Ensure your api package exposes `api_router`."
     ) from exc
 
-from starlette.middleware.gzip import GZipMiddleware  # NEW
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stethoscribe-main")
@@ -194,36 +194,31 @@ def _get_signature_key(secret_key: str, date_stamp: str, region_name: str, servi
     k_service = hmac.new(k_region, service_name.encode("utf-8"), hashlib.sha256).digest()
     return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
 
-TRANSLATE_MAX_BYTES = 9000  # conservative margin under the 10,000-byte limit
+
+# ---------- Long-text translation helpers (chunking under Translate limits) ----------
+
+TRANSLATE_MAX_BYTES = 9000  # margin under the 10,000-byte limit
 
 def _utf8_len(s: str) -> int:
     return len(s.encode("utf-8"))
 
 def _has_cjk(text: str) -> bool:
-    # Same heuristic you already use, factored out
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
-def _split_sentences(text: str) -> list[str]:
-    """
-    Split text into sentences while keeping punctuation, covering English and common CJK punctuation.
-    Falls back to whole text if regex fails to split.
-    """
-    # First split on paragraphs to preserve structure
+def _split_sentences(text: str) -> List[str]:
     paragraphs = re.split(r"\n{2,}", text.strip())
-    out: list[str] = []
+    out: List[str] = []
     sent_re = re.compile(r"(.+?[\.!?。！？；;])(\s+|$)", re.S)
     for para in paragraphs:
         if _utf8_len(para) <= TRANSLATE_MAX_BYTES:
             out.append(para.strip())
             continue
-        # Try sentence-level splitting
         idx = 0
         any_match = False
         for m in sent_re.finditer(para):
             any_match = True
             out.append((m.group(1) or "").strip())
             idx = m.end()
-        # tail
         if idx < len(para):
             tail = para[idx:].strip()
             if tail:
@@ -232,14 +227,10 @@ def _split_sentences(text: str) -> list[str]:
             out.append(para.strip())
     return [s for s in out if s]
 
-def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> list[str]:
-    """
-    Build byte-safe chunks <= max_bytes, preferring sentence boundaries.
-    If a single sentence exceeds max_bytes, hard-wrap by bytes.
-    """
+def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> List[str]:
     sentences = _split_sentences(text)
-    chunks: list[str] = []
-    buf: list[str] = []
+    chunks: List[str] = []
+    buf: List[str] = []
     buf_bytes = 0
 
     def flush():
@@ -255,9 +246,8 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
             continue
         s_bytes = _utf8_len(s)
         if s_bytes > max_bytes:
-            # Sentence is too large — split by raw bytes
             flush()
-            curr = []
+            curr: List[str] = []
             curr_bytes = 0
             for ch in s:
                 ch_b = _utf8_len(ch)
@@ -273,7 +263,7 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
 
         if buf_bytes + (1 if buf else 0) + s_bytes <= max_bytes:
             buf.append(s)
-            buf_bytes += (1 if buf_bytes else 0) + s_bytes  # account for join space
+            buf_bytes += (1 if buf_bytes else 0) + s_bytes
         else:
             flush()
             buf = [s]
@@ -283,27 +273,165 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
     return chunks
 
 def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
-    """
-    Translate arbitrarily long text by chunking under Amazon Translate limits.
-    """
     if not text.strip():
         return text
     if _utf8_len(text) <= TRANSLATE_MAX_BYTES:
-        # Simple path
         result = get_translate_client().translate_text(
             Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
         )
         return result["TranslatedText"]
 
     pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
-    out: list[str] = []
+    out: List[str] = []
     for piece in pieces:
         res = get_translate_client().translate_text(
             Text=piece, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
         )
         out.append(res["TranslatedText"])
-    # Join with double newlines so paragraph boundaries remain readable
     return "\n\n".join(out)
+
+
+# ---------- Prompting / note generation ----------
+
+def generate_note_from_scratch(
+    comprehend_json: Dict[str, Any],
+    full_transcript: str,
+    patient_info: Optional[Dict[str, Any]],
+    note_type: str,
+) -> Dict[str, Any]:
+    try:
+        prompt_module = get_prompt_generator(note_type)
+        logger.info("Generating %s note via modular prompt system.", prompt_module.NOTE_TYPE)
+        system_prompt = prompt_module.generate_prompt(patient_info)
+    except ValueError as exc:
+        logger.error("Invalid note type requested: %s", note_type)
+        raise ValueError(f"Invalid note type: {note_type}") from exc
+
+    user_payload = json.dumps({
+        "full_transcript": full_transcript,
+        "ents": comprehend_json.get("ents", []),
+        "ents_summary": comprehend_json.get("ents_summary", {}),
+        "phi_counts": comprehend_json.get("phi_counts", {}),
+    })
+    composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
+    body = json.dumps({"prompt": composed_prompt, "max_tokens": 4096, "temperature": 0.1})
+
+    try:
+        response = get_bedrock_client().invoke_model(
+            body=body,
+            modelId=settings.bedrock_model_id,
+            accept="application/json",
+            contentType="application/json",
+        )
+        response_body = json.loads(response.get("body").read())
+        model_output = response_body.get("outputs", [{}])[0].get("text", "")
+        stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
+
+        try:
+            start_index = model_output.find("{")
+            if start_index == -1:
+                raise ValueError("Could not find JSON object in Bedrock response.")
+
+            json_substring = model_output[start_index:].strip()
+
+            if json_substring.startswith("```"):
+                lines = json_substring.split("\n")
+                json_substring = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+            brace_level = 0
+            last_brace_index = -1
+            for idx, char in enumerate(json_substring):
+                if char == "{":
+                    brace_level += 1
+                elif char == "}":
+                    brace_level -= 1
+                    if brace_level == 0:
+                        last_brace_index = idx
+            if last_brace_index != -1:
+                json_substring = json_substring[: last_brace_index + 1]
+            elif not json_substring.endswith("}"):
+                json_substring += "}"
+
+            json_substring = re.sub(r'"text:\s*"', '"text": "', json_substring)
+            json_substring = re.sub(r'"(\w+):\s*', r'"\1": ', json_substring)
+
+            parsed = json.loads(json_substring)
+            logger.info("Successfully generated note with %d top-level sections.", len(parsed))
+            return parsed
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Initial JSON parse failed: %s. Attempting repair.", exc)
+            try:
+                # Simple repair attempts
+                repaired = json_substring
+                if 'text:' in repaired:
+                    repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
+                repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
+                parsed = json.loads(repaired)
+                logger.info("Successfully parsed JSON after repair step.")
+                return parsed
+            except Exception as repair_error:
+                error_msg = (
+                    "Failed to parse JSON from final note even after repair. "
+                    f"Stop Reason: {stop_reason}. Original error: {exc}. "
+                    f"Repair error: {repair_error}. Full Generation: '{model_output}'"
+                )
+                raise ValueError(error_msg) from repair_error
+    except Exception as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError(f"Bedrock invocation failed: {exc}") from exc
+
+
+def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Produce a compact, high-signal summary of Comprehend Medical entities for the LLM:
+      - Keep only relevant categories at high confidence.
+      - Deduplicate by (text.lower(), category, type).
+      - Cap to MAX_ENTS.
+      - Use short keys for each entity: {t, c, y}.
+      - Do NOT include PHI strings; only return PHI counts by Type.
+    """
+    SCORE_MIN = 0.90
+    MAX_ENTS = 200
+    ALLOWED = {"MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY"}
+    PHI_CATEGORY = "PROTECTED_HEALTH_INFORMATION"
+
+    ents: List[Dict[str, Any]] = []
+    summary: Dict[str, int] = {}
+    phi_counts: Dict[str, int] = {}
+    seen = set()
+
+    for e in raw_entities or []:
+        cat = str(e.get("Category") or "")
+        typ = str(e.get("Type") or "")
+        txt = str(e.get("Text") or "").strip()
+        score = float(e.get("Score") or 0.0)
+        if not txt or score < SCORE_MIN:
+            continue
+
+        if cat == PHI_CATEGORY:
+            phi_counts[typ] = phi_counts.get(typ, 0) + 1
+            continue
+
+        if cat not in ALLOWED:
+            continue
+
+        key = (txt.lower(), cat, typ)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        ents.append({"t": txt, "c": cat, "y": typ})
+        summary[cat] = summary.get(cat, 0) + 1
+
+        if len(ents) >= MAX_ENTS:
+            break
+
+    ents.sort(key=lambda d: (d["c"], d["y"], d["t"]))
+    return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
+
+
+# ---------- Routes ----------
 
 def build_presigned_url(selected_language: str = "en-US") -> str:
     if not settings.aws_access_key_id or not settings.aws_secret_access_key:
@@ -455,9 +583,7 @@ def register_routes(app: FastAPI) -> None:
                             for event in parser.parse(message.data):
                                 event_type = event.get("type")
                                 if event_type != "TranscriptEvent":
-                                    logger.debug(
-                                        "Received non-transcript event from AWS: %s", event
-                                    )
+                                    logger.debug("Received non-transcript event from AWS: %s", event)
                                     continue
 
                                 payload = event["payload"]
@@ -472,9 +598,7 @@ def register_routes(app: FastAPI) -> None:
                                             await ws.send_text(json.dumps(payload))
                                         continue
 
-                                    original_text = (
-                                        result.get("Alternatives", [{}])[0].get("Transcript", "")
-                                    )
+                                    original_text = result.get("Alternatives", [{}])[0].get("Transcript", "")
                                     if not original_text:
                                         continue
 
@@ -536,116 +660,56 @@ def register_routes(app: FastAPI) -> None:
         finally:
             logger.info("Browser session ended.")
 
-    TRANSLATE_MAX_BYTES = 9000  # conservative margin under the 10,000-byte limit
+    @app.post("/generate-final-note")
+    async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
+        full_transcript = (payload.full_transcript or "").strip()
+        if not full_transcript:
+            raise HTTPException(status_code=400, detail="Received an empty transcript.")
 
-def _utf8_len(s: str) -> int:
-    return len(s.encode("utf-8"))
-
-def _has_cjk(text: str) -> bool:
-    # Same heuristic you already use, factored out
-    return bool(re.search(r"[\u4e00-\u9fff]", text))
-
-def _split_sentences(text: str) -> list[str]:
-    """
-    Split text into sentences while keeping punctuation, covering English and common CJK punctuation.
-    Falls back to whole text if regex fails to split.
-    """
-    # First split on paragraphs to preserve structure
-    paragraphs = re.split(r"\n{2,}", text.strip())
-    out: list[str] = []
-    sent_re = re.compile(r"(.+?[\.!?。！？；;])(\s+|$)", re.S)
-    for para in paragraphs:
-        if _utf8_len(para) <= TRANSLATE_MAX_BYTES:
-            out.append(para.strip())
-            continue
-        # Try sentence-level splitting
-        idx = 0
-        any_match = False
-        for m in sent_re.finditer(para):
-            any_match = True
-            out.append((m.group(1) or "").strip())
-            idx = m.end()
-        # tail
-        if idx < len(para):
-            tail = para[idx:].strip()
-            if tail:
-                out.append(tail)
-        if not any_match and para.strip():
-            out.append(para.strip())
-    return [s for s in out if s]
-
-def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> list[str]:
-    """
-    Build byte-safe chunks <= max_bytes, preferring sentence boundaries.
-    If a single sentence exceeds max_bytes, hard-wrap by bytes.
-    """
-    sentences = _split_sentences(text)
-    chunks: list[str] = []
-    buf: list[str] = []
-    buf_bytes = 0
-
-    def flush():
-        nonlocal buf, buf_bytes
-        if buf:
-            chunks.append(" ".join(buf))
-            buf = []
-            buf_bytes = 0
-
-    for s in sentences:
-        s = s.strip()
-        if not s:
-            continue
-        s_bytes = _utf8_len(s)
-        if s_bytes > max_bytes:
-            # Sentence is too large — split by raw bytes
-            flush()
-            curr = []
-            curr_bytes = 0
-            for ch in s:
-                ch_b = _utf8_len(ch)
-                if curr_bytes + ch_b > max_bytes:
-                    chunks.append("".join(curr))
-                    curr = []
-                    curr_bytes = 0
-                curr.append(ch)
-                curr_bytes += ch_b
-            if curr:
-                chunks.append("".join(curr))
-            continue
-
-        if buf_bytes + (1 if buf else 0) + s_bytes <= max_bytes:
-            buf.append(s)
-            buf_bytes += (1 if buf_bytes else 0) + s_bytes  # account for join space
-        else:
-            flush()
-            buf = [s]
-            buf_bytes = s_bytes
-
-    flush()
-    return chunks
-
-def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
-    """
-    Translate arbitrarily long text by chunking under Amazon Translate limits.
-    """
-    if not text.strip():
-        return text
-    if _utf8_len(text) <= TRANSLATE_MAX_BYTES:
-        # Simple path
-        result = get_translate_client().translate_text(
-            Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
+        logger.info(
+            "Received transcript (%d chars) for note_type=%s",
+            len(full_transcript),
+            payload.note_type,
         )
-        return result["TranslatedText"]
 
-    pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
-    out: list[str] = []
-    for piece in pieces:
-        res = get_translate_client().translate_text(
-            Text=piece, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
-        )
-        out.append(res["TranslatedText"])
-    # Join with double newlines so paragraph boundaries remain readable
-    return "\n\n".join(out)
+        patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
+
+        try:
+            # Translate to English if needed (chunked safely)
+            if _has_cjk(full_transcript):
+                logger.info("Detected CJK characters. Translating to English with chunking.")
+                english_transcript = _translate_large_text("zh", "en", full_transcript)
+                logger.info("Translation complete. English transcript length=%d.", len(english_transcript))
+            else:
+                english_transcript = full_transcript
+
+            # Comprehend Medical entity detection (then compact for prompt)
+            entities_response = get_comprehend_client().detect_entities_v2(Text=english_transcript)
+            entities = entities_response.get("Entities", []) or []
+            logger.info("Comprehend Medical returned %d entities.", len(entities))
+            ents_compact = _filter_and_compact_entities_for_llm(entities)
+
+            # Generate note via prompt system
+            final_note = generate_note_from_scratch(
+                comprehend_json=ents_compact,
+                full_transcript=english_transcript,
+                patient_info=patient_info_dict,
+                note_type=payload.note_type,
+            )
+
+            # Optional normalization for "standard"
+            if payload.note_type == "standard":
+                final_note = _normalize_assessment_plan(
+                    _normalize_empty_sections(_fix_pertinent_negatives(final_note))
+                )
+
+            return {"notes": final_note}
+        except ValueError as exc:
+            logger.error("Note generation error: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Unexpected error during final note generation.")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/execute-command")
     async def execute_command(payload: CommandPayload) -> Dict[str, str]:
@@ -707,10 +771,8 @@ def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
 def create_app() -> FastAPI:
     app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
 
-    # Gzip compress larger responses (notes, segments lists)
-    app.add_middleware(GZipMiddleware, minimum_size=512)  # NEW
+    app.add_middleware(GZipMiddleware, minimum_size=512)
 
-    # CORS: be explicit and robust
     allowed = settings.allowed_origins or ["*"]
     allow_credentials = False if "*" in allowed else True
     logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
@@ -768,174 +830,8 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
     return note
 
 
-def _insert_missing_commas(raw_json: str) -> str:
-    lines = raw_json.splitlines()
-    fixed_lines: List[str] = []
-
-    for idx, line in enumerate(lines):
-        stripped_line = line.rstrip()
-        trimmed = stripped_line.strip()
-
-        if trimmed.startswith('"') and ":" in trimmed and not trimmed.endswith(","):
-            next_trimmed = ""
-            for j in range(idx + 1, len(lines)):
-                next_trimmed = lines[j].strip()
-                if next_trimmed:
-                    break
-            if next_trimmed and not next_trimmed.startswith(("}", "]")):
-                stripped_line += ","
-        fixed_lines.append(stripped_line)
-
-    return "\n".join(fixed_lines)
-
-
-def generate_note_from_scratch(
-    comprehend_json: Dict[str, Any],
-    full_transcript: str,
-    patient_info: Optional[Dict[str, Any]],
-    note_type: str,
-) -> Dict[str, Any]:
-    try:
-        prompt_module = get_prompt_generator(note_type)
-        logger.info("Generating %s note via modular prompt system.", prompt_module.NOTE_TYPE)
-        system_prompt = prompt_module.generate_prompt(patient_info)
-    except ValueError as exc:
-        logger.error("Invalid note type requested: %s", note_type)
-        raise ValueError(f"Invalid note type: {note_type}") from exc
-
-    # Compact user payload: transcript + compact entities and summaries
-    user_payload = json.dumps({
-        "full_transcript": full_transcript,
-        "ents": comprehend_json.get("ents", []),
-        "ents_summary": comprehend_json.get("ents_summary", {}),
-        "phi_counts": comprehend_json.get("phi_counts", {}),
-    })
-    composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
-    body = json.dumps({"prompt": composed_prompt, "max_tokens": 4096, "temperature": 0.1})
-
-    try:
-        response = get_bedrock_client().invoke_model(
-            body=body,
-            modelId=settings.bedrock_model_id,
-            accept="application/json",
-            contentType="application/json",
-        )
-        response_body = json.loads(response.get("body").read())
-        model_output = response_body.get("outputs", [{}])[0].get("text", "")
-        stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
-
-        try:
-            start_index = model_output.find("{")
-            if start_index == -1:
-                raise ValueError("Could not find JSON object in Bedrock response.")
-
-            json_substring = model_output[start_index:].strip()
-
-            if json_substring.startswith("```"):
-                lines = json_substring.split("\n")
-                json_substring = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-
-            brace_level = 0
-            last_brace_index = -1
-            for idx, char in enumerate(json_substring):
-                if char == "{":
-                    brace_level += 1
-                elif char == "}":
-                    brace_level -= 1
-                    if brace_level == 0:
-                        last_brace_index = idx
-            if last_brace_index != -1:
-                json_substring = json_substring[: last_brace_index + 1]
-            elif not json_substring.endswith("}"):
-                json_substring += "}"
-
-            json_substring = re.sub(r'"text:\s*"', '"text": "', json_substring)
-            json_substring = re.sub(r'"(\w+):\s*', r'"\1": ', json_substring)
-
-            parsed = json.loads(json_substring)
-            logger.info("Successfully generated note with %d top-level sections.", len(parsed))
-            return parsed
-        except (ValueError, json.JSONDecodeError) as exc:
-            logger.warning("Initial JSON parse failed: %s. Attempting repair.", exc)
-            try:
-                repaired = _insert_missing_commas(json_substring)
-                repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
-                repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
-                parsed = json.loads(repaired)
-                logger.info("Successfully parsed JSON after repair step.")
-                return parsed
-            except Exception as repair_error:
-                error_msg = (
-                    "Failed to parse JSON from final note even after repair. "
-                    f"Stop Reason: {stop_reason}. Original error: {exc}. "
-                    f"Repair error: {repair_error}. Full Generation: '{model_output}'"
-                )
-                raise ValueError(error_msg) from repair_error
-    except Exception as exc:
-        if isinstance(exc, ValueError):
-            raise
-        raise ValueError(f"Bedrock invocation failed: {exc}") from exc
-
-
 app = create_app()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-
-
-# ------------------------------
-# LLM token-optimized entity view
-# ------------------------------
-def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Produce a compact, high-signal summary of Comprehend Medical entities for the LLM:
-      - Keep only relyevant categories at high confidence.
-      - Deduplicate b (text.lower(), category, type).
-      - Cap to MAX_ENTS.
-      - Use short keys for each entity: {t, c, y}.
-      - Do NOT include PHI strings; only return PHI counts by Type.
-    """
-    # Tunables
-    SCORE_MIN = 0.90
-    MAX_ENTS = 200
-    ALLOWED = {"MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY"}
-    PHI_CATEGORY = "PROTECTED_HEALTH_INFORMATION"
-
-    ents: List[Dict[str, Any]] = []
-    summary: Dict[str, int] = {}
-    phi_counts: Dict[str, int] = {}
-    seen = set()  # for de-dupe
-
-    for e in raw_entities or []:
-        cat = str(e.get("Category") or "")
-        typ = str(e.get("Type") or "")
-        txt = str(e.get("Text") or "").strip()
-        score = float(e.get("Score") or 0.0)
-        if not txt or score < SCORE_MIN:
-            continue
-
-        if cat == PHI_CATEGORY:
-            # Count PHI by type (no PHI text included)
-            phi_counts[typ] = phi_counts.get(typ, 0) + 1
-            continue
-
-        if cat not in ALLOWED:
-            continue
-
-        key = (txt.lower(), cat, typ)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        # Compact entity representation
-        ents.append({"t": txt, "c": cat, "y": typ})
-        summary[cat] = summary.get(cat, 0) + 1
-
-        if len(ents) >= MAX_ENTS:
-            break
-
-    # Stable ordering for determinism
-    ents.sort(key=lambda d: (d["c"], d["y"], d["t"]))
-
-    return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
