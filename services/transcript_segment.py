@@ -127,7 +127,7 @@ class TranscriptSegmentService(DynamoServiceMixin):
         items = await self._query_segments_for_consultation(cid)
         normalized: List[TranscriptSegmentRead] = []
 
-         for it in items:
+        for it in items:
             # ... normalization logic unchanged ...
             consultation_id_norm = str(it.get("consultation_id") or it.get("consultationId") or cid)
             sequence_number = _to_int(it.get("sequence_number") or it.get("segmentIndex"), 0)
