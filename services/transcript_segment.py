@@ -13,7 +13,7 @@ from schemas.transcript_segment import (
     TranscriptSegmentRead,
     TranscriptSegmentUpdate,
 )
-
+from services import nlp  # NEW
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -30,25 +30,25 @@ class TranscriptSegmentService(DynamoServiceMixin):
     async def list_for_consultation(
         self,
         consultation_id: str | UUID,
+        *,
+        include_entities: bool = False,  # NEW
     ) -> List[TranscriptSegmentRead]:
         """
-        Read-all via scan (kept simple), normalize legacy (camelCase) and new (snake_case)
-        shapes into TranscriptSegmentRead.
+        Normalize legacy/new rows and optionally enrich with Comprehend Medical.
+        Always return entities as a list for frontend highlighting.
         """
         cid = str(consultation_id)
         items = await self.scan_all()
 
-        # Filter by either consultationId (legacy) or consultation_id (new)
+        # Filter rows for this consultation
         filtered = [
             item
             for item in items
             if str(item.get("consultation_id") or item.get("consultationId") or "") == cid
         ]
 
-        # Normalize each item to the read-model fields
-        normalized = []
+        normalized: List[TranscriptSegmentRead] = []
         for it in filtered:
-            # Prefer snake_case, fall back to legacy camelCase
             consultation_id_norm = str(it.get("consultation_id") or it.get("consultationId") or cid)
             sequence_number = _to_int(it.get("sequence_number") or it.get("segmentIndex"), 0)
             speaker_label = it.get("speaker_label") or it.get("speaker") or None
@@ -62,10 +62,27 @@ class TranscriptSegmentService(DynamoServiceMixin):
             detected_language = it.get("detected_language") or None
             created_at = it.get("created_at") or _now_iso()
 
-            # Ensure a stable segment_id:
+            # Normalize entities to a list of dicts:
+            entities_val = it.get("entities")
+            if isinstance(entities_val, dict) and "Entities" in entities_val:
+                entities_list = entities_val.get("Entities") or []
+            elif isinstance(entities_val, list):
+                entities_list = entities_val
+            else:
+                entities_list = []
+
+            # Enrich on demand
+            if include_entities:
+                text_en = nlp.to_english(original_text, detected_language)
+                try:
+                    entities_list = nlp.detect_entities(text_en)
+                except Exception:
+                    # If call fails for a segment, keep previous/empty list
+                    pass
+
+            # Ensure a stable segment_id for legacy rows
             seg_id = it.get("segment_id")
             if not seg_id:
-                # Deterministic UUID derived from (consultation_id, sequence_number)
                 seg_id = str(uuid5(NAMESPACE_DNS, f"{consultation_id_norm}:{sequence_number}"))
 
             data = {
@@ -79,12 +96,11 @@ class TranscriptSegmentService(DynamoServiceMixin):
                 "detected_language": detected_language,
                 "start_time_ms": it.get("start_time_ms"),
                 "end_time_ms": it.get("end_time_ms"),
-                "entities": it.get("entities"),
+                "entities": entities_list,  # ALWAYS a list on read
                 "created_at": created_at,
             }
             normalized.append(TranscriptSegmentRead.model_validate(data))
 
-        # Sort by sequence_number for stable reconstruction
         normalized.sort(key=lambda x: x.sequence_number)
         return normalized
 
@@ -93,36 +109,27 @@ class TranscriptSegmentService(DynamoServiceMixin):
         payload: TranscriptSegmentCreate,
     ) -> TranscriptSegmentRead:
         """
-        Write into the existing table schema that uses:
-          - PK: consultationId (string)
-          - SK: segmentIndex (number)
-        Also store snake_case fields so API read-model maps cleanly.
+        Write into the existing table schema (consultationId + segmentIndex).
+        Store snake_case fields for clean reads. We do not persist entities here.
         """
         data = payload.model_dump()
-        # Route injected this; validation now allows body without it
         consultation_id = str(data.get("consultation_id"))
         if not consultation_id or consultation_id == "None":
             raise ValueError("consultation_id is required at service layer")
 
-        # Required for legacy table key
         segment_index = _to_int(data.get("sequence_number"), 0)
-
-        # Generate server-side fields
         segment_id = str(uuid4())
         created_at = _now_iso()
 
-        # Compose item merging both worlds:
-        # - legacy keys for table primary key
-        # - snake_case fields for clean API reading
         item = {
             # Legacy table keys
             "consultationId": consultation_id,
             "segmentIndex": segment_index,
 
-            # Keep new/clean schema as first-class fields
+            # Clean schema fields (snake_case)
             "segment_id": segment_id,
             "consultation_id": consultation_id,
-            "sequence_number": segment_index,  # mirror for clarity
+            "sequence_number": segment_index,
             "speaker_label": data.get("speaker_label"),
             "speaker_role": data.get("speaker_role"),
             "original_text": data.get("original_text") or "",
@@ -130,10 +137,10 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "detected_language": data.get("detected_language"),
             "start_time_ms": data.get("start_time_ms"),
             "end_time_ms": data.get("end_time_ms"),
-            "entities": data.get("entities"),
+            "entities": None,  # not persisted
             "created_at": created_at,
 
-            # Optional legacy convenience mirrors (not required but helps if you ever fall back)
+            # Optional legacy mirrors
             "text": data.get("original_text") or "",
             "displayText": data.get("original_text") or "",
             "translatedText": data.get("translated_text"),
@@ -141,7 +148,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
 
         await run_in_thread(self.table.put_item, Item=self.serialize_input(item))
 
-        # IMPORTANT: Return only the API read model fields (no legacy/camelCase extras)
         response_data = {
             "segment_id": segment_id,
             "consultation_id": consultation_id,
@@ -153,17 +159,24 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "detected_language": item.get("detected_language"),
             "start_time_ms": item.get("start_time_ms"),
             "end_time_ms": item.get("end_time_ms"),
-            "entities": item.get("entities"),
+            "entities": [],  # return empty list to UI
             "created_at": created_at,
         }
         return TranscriptSegmentRead.model_validate(response_data)
 
     async def get(self, segment_id: str | UUID) -> TranscriptSegmentRead:
-        # Not used by the UI today; fallback: scan then match by segment_id
         items = await self.scan_all()
         for it in items:
             if str(it.get("segment_id")) == str(segment_id):
-                # Normalize to read model
+                # Normalize entities to a list on read
+                entities_val = it.get("entities")
+                if isinstance(entities_val, dict) and "Entities" in entities_val:
+                    entities_list = entities_val.get("Entities") or []
+                elif isinstance(entities_val, list):
+                    entities_list = entities_val
+                else:
+                    entities_list = []
+
                 data = {
                     "segment_id": str(it.get("segment_id")),
                     "consultation_id": str(it.get("consultation_id") or it.get("consultationId") or ""),
@@ -175,7 +188,7 @@ class TranscriptSegmentService(DynamoServiceMixin):
                     "detected_language": it.get("detected_language") or None,
                     "start_time_ms": it.get("start_time_ms"),
                     "end_time_ms": it.get("end_time_ms"),
-                    "entities": it.get("entities"),
+                    "entities": entities_list,
                     "created_at": it.get("created_at") or _now_iso(),
                 }
                 return TranscriptSegmentRead.model_validate(data)
@@ -186,7 +199,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
         segment_id: str | UUID,
         payload: TranscriptSegmentUpdate,
     ) -> TranscriptSegmentRead:
-        # Fallback: scan to find the full item (to get its legacy keys), then replace
         items = await self.scan_all()
         target = None
         for it in items:
@@ -200,7 +212,15 @@ class TranscriptSegmentService(DynamoServiceMixin):
         merged = {**target, **self.serialize_input(updates)}
         await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
 
-        # Normalize to read model for response
+        # Normalize entities to list
+        entities_val = merged.get("entities")
+        if isinstance(entities_val, dict) and "Entities" in entities_val:
+            entities_list = entities_val.get("Entities") or []
+        elif isinstance(entities_val, list):
+            entities_list = entities_val
+        else:
+            entities_list = []
+
         data = {
             "segment_id": str(merged.get("segment_id")),
             "consultation_id": str(merged.get("consultation_id") or merged.get("consultationId") or ""),
@@ -212,13 +232,12 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "detected_language": merged.get("detected_language") or None,
             "start_time_ms": merged.get("start_time_ms"),
             "end_time_ms": merged.get("end_time_ms"),
-            "entities": merged.get("entities"),
+            "entities": entities_list,
             "created_at": merged.get("created_at") or _now_iso(),
         }
         return TranscriptSegmentRead.model_validate(data)
 
     async def delete(self, segment_id: str | UUID) -> None:
-        # Fallback: scan to discover legacy keys and then delete by those keys
         items = await self.scan_all()
         target = None
         for it in items:
@@ -232,23 +251,11 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "consultationId": target["consultationId"],
             "segmentIndex": target["segmentIndex"],
         }
-        try:
-            await run_in_thread(
-                self.table.delete_item,
-                Key=key,
-                ConditionExpression="attribute_exists(consultationId) AND attribute_exists(segmentIndex)",
-            )
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                raise NotFoundError(f"Transcript segment with id={segment_id} was not found.") from exc
-            raise
+        await run_in_thread(self.table.delete_item, Key=key)
 
 
-# IMPORTANT: keep the existing table name, but do not set partition_key to segment_id anymore,
-# because the real table uses a composite key (consultationId + segmentIndex).
-# We won't use DynamoServiceMixin.get_required_item (which needs a single key).
 transcript_segment_service = TranscriptSegmentService(
     table_env_name="TRANSCRIPT_SEGMENTS_TABLE_NAME",
     default_table_name="medical-scribe-transcript-segments",
-    partition_key="consultationId",  # only used by generic helpers; we avoid them for get/delete
+    partition_key="consultationId",
 )

@@ -16,15 +16,16 @@ def get_translate_client():
 def to_english(text: str, detected_language: Optional[str]) -> str:
     if not text:
         return ""
-    if detected_language and detected_language.lower().startswith("en"):
-      # already english
-      return text
-    # best-effort: if we know source lang code (e.g., zh), translate to English
+    if not detected_language:
+        return text
+    # If it's already English-ish, skip translation
+    if detected_language.lower().startswith("en"):
+        return text
     try:
-        source = (detected_language or "auto").split("-")[0]
+        source = detected_language.split("-")[0]
         res = get_translate_client().translate_text(
             Text=text,
-            SourceLanguageCode=source if source != "auto" else "auto",
+            SourceLanguageCode=source or "auto",
             TargetLanguageCode="en",
         )
         return res.get("TranslatedText", text)
@@ -32,11 +33,11 @@ def to_english(text: str, detected_language: Optional[str]) -> str:
         return text
 
 
-def detect_entities_en(text_en: str) -> List[Dict[str, Any]]:
+def detect_entities(text_en: str) -> List[Dict[str, Any]]:
     if not text_en:
         return []
     try:
-        res = get_comprehend_client().detect_entities_v2(Text=text_en)
-        return res.get("Entities", [])
+        resp = get_comprehend_client().detect_entities_v2(Text=text_en)
+        return resp.get("Entities", [])
     except Exception:
         return []

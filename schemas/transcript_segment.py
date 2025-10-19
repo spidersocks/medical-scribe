@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, conint, constr
@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, conint, constr
 SpeakerField = constr(max_length=50)
 LanguageField = constr(max_length=20)
 ConsultationIdField = constr(min_length=1, max_length=64)  # accept any non-empty id
+
+# For maximum compatibility: allow either a raw list of entities or a dict wrapper (e.g., {"Entities":[...]})
+EntitiesField = Optional[Union[List[Dict[str, Any]], Dict[str, Any]]]
 
 
 class TranscriptSegmentBase(BaseModel):
@@ -22,7 +25,7 @@ class TranscriptSegmentBase(BaseModel):
     detected_language: Optional[LanguageField] = None
     start_time_ms: Optional[conint(ge=0)] = None
     end_time_ms: Optional[conint(ge=0)] = None
-    entities: Optional[Dict] = None
+    entities: EntitiesField = None  # <- allow list/dict/None
 
     model_config = ConfigDict(
         from_attributes=True,
@@ -31,8 +34,7 @@ class TranscriptSegmentBase(BaseModel):
     )
 
 
-# IMPORTANT: Make consultation_id optional for the request body so FastAPI doesn't
-# require it in the JSON. The route will inject the path param afterward.
+# Make consultation_id optional in Create so path param can be injected in the route.
 class TranscriptSegmentCreate(TranscriptSegmentBase):
     consultation_id: Optional[ConsultationIdField] = None
 
@@ -40,7 +42,7 @@ class TranscriptSegmentCreate(TranscriptSegmentBase):
 class TranscriptSegmentUpdate(BaseModel):
     translated_text: Optional[str] = None
     detected_language: Optional[LanguageField] = None
-    entities: Optional[Dict] = None
+    entities: EntitiesField = None
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 

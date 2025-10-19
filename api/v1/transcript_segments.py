@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import List
-# from uuid import UUID  # no longer needed for path param
 
 from fastapi import APIRouter, Response, status
 
@@ -21,15 +20,14 @@ router = APIRouter()
     response_model=List[TranscriptSegmentRead],
 )
 async def list_segments_for_consultation(
-    consultation_id: str,  # accept any string id to support non-UUID consultations
-    include_entities: bool = False,  # optional: future enrichment knob
+    consultation_id: str,
+    include_entities: bool = False,
 ) -> List[TranscriptSegmentRead]:
-    # We simply pass the string id through; the service already compares as string.
-    segments = await guard_service(
-        transcript_segment_service.list_for_consultation(consultation_id)
+    return await guard_service(
+        transcript_segment_service.list_for_consultation(
+            consultation_id, include_entities=include_entities
+        )
     )
-    # If you later add on-demand enrichment, do it here when include_entities is True.
-    return segments
 
 
 @router.post(
@@ -41,7 +39,6 @@ async def create_segment_for_consultation(
     consultation_id: str,
     payload: TranscriptSegmentCreate,
 ) -> TranscriptSegmentRead:
-    # DEBUG LOG
     print("[transcript_segments] POST create called", {
         "consultation_id": consultation_id,
         "payload": payload.model_dump()
@@ -50,6 +47,7 @@ async def create_segment_for_consultation(
     return await guard_service(
         transcript_segment_service.create(payload_with_consultation)
     )
+
 
 @router.get("/segments/{segment_id}", response_model=TranscriptSegmentRead)
 async def get_segment(segment_id: str) -> TranscriptSegmentRead:
