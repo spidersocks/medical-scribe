@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import List
-from uuid import UUID, uuid4
+from typing import List, Optional
+from uuid import UUID, uuid4, uuid5, NAMESPACE_DNS
 from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError  # type: ignore
@@ -15,63 +15,183 @@ from schemas.transcript_segment import (
 )
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _to_int(val: Optional[object], default: int = 0) -> int:
+    try:
+        return int(val)  # type: ignore[arg-type]
+    except Exception:
+        return default
+
+
 class TranscriptSegmentService(DynamoServiceMixin):
     async def list_for_consultation(
         self,
         consultation_id: str | UUID,
     ) -> List[TranscriptSegmentRead]:
-        consultation_id_str = str(consultation_id)
+        """
+        Read-all via scan (kept simple), normalize legacy (camelCase) and new (snake_case)
+        shapes into TranscriptSegmentRead.
+        """
+        cid = str(consultation_id)
         items = await self.scan_all()
+
+        # Filter by either consultationId (legacy) or consultation_id (new)
         filtered = [
             item
             for item in items
-            if str(item.get("consultation_id")) == consultation_id_str
+            if str(item.get("consultation_id") or item.get("consultationId") or "") == cid
         ]
-        # Ensure stable ordering
-        filtered.sort(key=lambda x: int(x.get("sequence_number", 0)))
-        return [TranscriptSegmentRead.model_validate(item) for item in filtered]
+
+        # Normalize each item to the read-model fields
+        normalized = []
+        for it in filtered:
+            # Prefer snake_case, fall back to legacy camelCase
+            consultation_id_norm = str(it.get("consultation_id") or it.get("consultationId") or cid)
+            sequence_number = _to_int(it.get("sequence_number") or it.get("segmentIndex"), 0)
+            speaker_label = it.get("speaker_label") or it.get("speaker") or None
+            original_text = (
+                it.get("original_text")
+                or it.get("text")
+                or it.get("displayText")
+                or ""
+            )
+            translated_text = it.get("translated_text") or it.get("translatedText") or None
+            detected_language = it.get("detected_language") or None
+            created_at = it.get("created_at") or _now_iso()
+
+            # Ensure a stable segment_id:
+            seg_id = it.get("segment_id")
+            if not seg_id:
+                # Deterministic UUID derived from (consultation_id, sequence_number)
+                seg_id = str(uuid5(NAMESPACE_DNS, f"{consultation_id_norm}:{sequence_number}"))
+
+            data = {
+                "segment_id": seg_id,
+                "consultation_id": consultation_id_norm,
+                "sequence_number": sequence_number,
+                "speaker_label": speaker_label,
+                "speaker_role": it.get("speaker_role") or None,
+                "original_text": original_text,
+                "translated_text": translated_text,
+                "detected_language": detected_language,
+                "start_time_ms": it.get("start_time_ms"),
+                "end_time_ms": it.get("end_time_ms"),
+                "entities": it.get("entities"),
+                "created_at": created_at,
+            }
+            normalized.append(TranscriptSegmentRead.model_validate(data))
+
+        # Sort by sequence_number for stable reconstruction
+        normalized.sort(key=lambda x: x.sequence_number)
+        return normalized
 
     async def create(
         self,
         payload: TranscriptSegmentCreate,
     ) -> TranscriptSegmentRead:
+        """
+        Write into the existing table schema that uses:
+          - PK: consultationId (string)
+          - SK: segmentIndex (number)
+        Also store snake_case fields so API read-model maps cleanly.
+        """
         data = payload.model_dump()
-        raw_id = data.pop("id", None)
-        segment_id = str(raw_id or uuid4())
+        # Route injected this; validation now allows body without it
+        consultation_id = str(data.get("consultation_id"))
+        if not consultation_id or consultation_id == "None":
+            raise ValueError("consultation_id is required at service layer")
 
-        # Stamp created_at if not present
-        if "created_at" not in data:
-            data["created_at"] = datetime.now(timezone.utc).isoformat()
+        # Required for legacy table key
+        segment_index = _to_int(data.get("sequence_number"), 0)
 
-        # Store with partition key 'segment_id' to match schema
-        item = {"segment_id": segment_id, **self.serialize_input(data)}
-        await run_in_thread(self.table.put_item, Item=item)
+        # Generate server-side fields
+        segment_id = str(uuid4())
+        created_at = _now_iso()
+
+        # Compose item merging both worlds:
+        # - legacy keys for table primary key
+        # - snake_case fields for clean API reading
+        item = {
+            # Legacy table keys
+            "consultationId": consultation_id,
+            "segmentIndex": segment_index,
+
+            # Keep new/clean schema as first-class fields
+            "segment_id": segment_id,
+            "consultation_id": consultation_id,
+            "sequence_number": segment_index,  # mirror for clarity
+            "speaker_label": data.get("speaker_label"),
+            "speaker_role": data.get("speaker_role"),
+            "original_text": data.get("original_text") or "",
+            "translated_text": data.get("translated_text"),
+            "detected_language": data.get("detected_language"),
+            "start_time_ms": data.get("start_time_ms"),
+            "end_time_ms": data.get("end_time_ms"),
+            "entities": data.get("entities"),
+            "created_at": created_at,
+
+            # Optional legacy convenience mirrors (not required but helps if you ever fall back)
+            "text": data.get("original_text") or "",
+            "displayText": data.get("original_text") or "",
+            "translatedText": data.get("translated_text"),
+        }
+
+        await run_in_thread(self.table.put_item, Item=self.serialize_input(item))
         clean_item = self.clean(item)
         return TranscriptSegmentRead.model_validate(clean_item)
 
     async def get(self, segment_id: str | UUID) -> TranscriptSegmentRead:
-        item = await self.get_required_item(str(segment_id))
-        return TranscriptSegmentRead.model_validate(item)
+        # Not used by the UI today; fallback: scan then match by segment_id
+        items = await self.scan_all()
+        for it in items:
+            if str(it.get("segment_id")) == str(segment_id):
+                return TranscriptSegmentRead.model_validate(it)
+        raise NotFoundError(f"Transcript segment with id={segment_id} was not found.")
 
     async def update(
         self,
         segment_id: str | UUID,
         payload: TranscriptSegmentUpdate,
     ) -> TranscriptSegmentRead:
-        existing = await self.get_required_item(str(segment_id))
+        # Fallback: scan to find the full item (to get its legacy keys), then replace
+        items = await self.scan_all()
+        target = None
+        for it in items:
+            if str(it.get("segment_id")) == str(segment_id):
+                target = it
+                break
+        if not target:
+            raise NotFoundError(f"Transcript segment with id={segment_id} was not found.")
+
         updates = payload.model_dump(exclude_unset=True)
-        merged = {**existing, **self.serialize_input(updates)}
+        merged = {**target, **self.serialize_input(updates)}
         await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
         clean_item = self.clean(merged)
         return TranscriptSegmentRead.model_validate(clean_item)
 
     async def delete(self, segment_id: str | UUID) -> None:
+        # Fallback: scan to discover legacy keys and then delete by those keys
+        items = await self.scan_all()
+        target = None
+        for it in items:
+            if str(it.get("segment_id")) == str(segment_id):
+                target = it
+                break
+        if not target:
+            raise NotFoundError(f"Transcript segment with id={segment_id} was not found.")
+
+        key = {
+            "consultationId": target["consultationId"],
+            "segmentIndex": target["segmentIndex"],
+        }
         try:
             await run_in_thread(
                 self.table.delete_item,
-                Key={self.partition_key: str(segment_id)},
-                ConditionExpression="attribute_exists(#pk)",
-                ExpressionAttributeNames={"#pk": self.partition_key},
+                Key=key,
+                ConditionExpression="attribute_exists(consultationId) AND attribute_exists(segmentIndex)",
             )
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -79,8 +199,11 @@ class TranscriptSegmentService(DynamoServiceMixin):
             raise
 
 
+# IMPORTANT: keep the existing table name, but do not set partition_key to segment_id anymore,
+# because the real table uses a composite key (consultationId + segmentIndex).
+# We won't use DynamoServiceMixin.get_required_item (which needs a single key).
 transcript_segment_service = TranscriptSegmentService(
     table_env_name="TRANSCRIPT_SEGMENTS_TABLE_NAME",
     default_table_name="medical-scribe-transcript-segments",
-    partition_key="segment_id",  # IMPORTANT: align key with API schema
+    partition_key="consultationId",  # only used by generic helpers; we avoid them for get/delete
 )
