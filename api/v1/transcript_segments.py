@@ -38,15 +38,18 @@ async def list_segments_for_consultation(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_segment_for_consultation(
-    consultation_id: str,  # accept any string id
+    consultation_id: str,
     payload: TranscriptSegmentCreate,
 ) -> TranscriptSegmentRead:
-    # Force the path param onto the payload (model will accept string now).
+    # DEBUG LOG
+    print("[transcript_segments] POST create called", {
+        "consultation_id": consultation_id,
+        "payload": payload.model_dump()
+    })
     payload_with_consultation = payload.copy(update={"consultation_id": consultation_id})
     return await guard_service(
         transcript_segment_service.create(payload_with_consultation)
     )
-
 
 @router.get("/segments/{segment_id}", response_model=TranscriptSegmentRead)
 async def get_segment(segment_id: str) -> TranscriptSegmentRead:
