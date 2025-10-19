@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List
 from uuid import UUID, uuid4
+from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError  # type: ignore
 
@@ -26,6 +27,8 @@ class TranscriptSegmentService(DynamoServiceMixin):
             for item in items
             if str(item.get("consultation_id")) == consultation_id_str
         ]
+        # Ensure stable ordering
+        filtered.sort(key=lambda x: int(x.get("sequence_number", 0)))
         return [TranscriptSegmentRead.model_validate(item) for item in filtered]
 
     async def create(
@@ -35,7 +38,13 @@ class TranscriptSegmentService(DynamoServiceMixin):
         data = payload.model_dump()
         raw_id = data.pop("id", None)
         segment_id = str(raw_id or uuid4())
-        item = {"id": segment_id, **self.serialize_input(data)}
+
+        # Stamp created_at if not present
+        if "created_at" not in data:
+            data["created_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Store with partition key 'segment_id' to match schema
+        item = {"segment_id": segment_id, **self.serialize_input(data)}
         await run_in_thread(self.table.put_item, Item=item)
         clean_item = self.clean(item)
         return TranscriptSegmentRead.model_validate(clean_item)
@@ -73,4 +82,5 @@ class TranscriptSegmentService(DynamoServiceMixin):
 transcript_segment_service = TranscriptSegmentService(
     table_env_name="TRANSCRIPT_SEGMENTS_TABLE_NAME",
     default_table_name="medical-scribe-transcript-segments",
+    partition_key="segment_id",  # IMPORTANT: align key with API schema
 )
