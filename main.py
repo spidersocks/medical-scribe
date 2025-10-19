@@ -540,14 +540,16 @@ def register_routes(app: FastAPI) -> None:
         return {"note_types": response}
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
+# CORS: be explicit and robust
+    allowed = settings.allowed_origins or ["*"]
+    allow_credentials = False if "*" in allowed else True
+    logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.allowed_origins or ["*"],
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_origins=allowed,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
         allow_headers=["*"],
         max_age=86400,
     )

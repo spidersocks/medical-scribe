@@ -140,15 +140,45 @@ class TranscriptSegmentService(DynamoServiceMixin):
         }
 
         await run_in_thread(self.table.put_item, Item=self.serialize_input(item))
-        clean_item = self.clean(item)
-        return TranscriptSegmentRead.model_validate(clean_item)
+
+        # IMPORTANT: Return only the API read model fields (no legacy/camelCase extras)
+        response_data = {
+            "segment_id": segment_id,
+            "consultation_id": consultation_id,
+            "sequence_number": segment_index,
+            "speaker_label": item.get("speaker_label"),
+            "speaker_role": item.get("speaker_role"),
+            "original_text": item.get("original_text") or "",
+            "translated_text": item.get("translated_text"),
+            "detected_language": item.get("detected_language"),
+            "start_time_ms": item.get("start_time_ms"),
+            "end_time_ms": item.get("end_time_ms"),
+            "entities": item.get("entities"),
+            "created_at": created_at,
+        }
+        return TranscriptSegmentRead.model_validate(response_data)
 
     async def get(self, segment_id: str | UUID) -> TranscriptSegmentRead:
         # Not used by the UI today; fallback: scan then match by segment_id
         items = await self.scan_all()
         for it in items:
             if str(it.get("segment_id")) == str(segment_id):
-                return TranscriptSegmentRead.model_validate(it)
+                # Normalize to read model
+                data = {
+                    "segment_id": str(it.get("segment_id")),
+                    "consultation_id": str(it.get("consultation_id") or it.get("consultationId") or ""),
+                    "sequence_number": _to_int(it.get("sequence_number") or it.get("segmentIndex"), 0),
+                    "speaker_label": it.get("speaker_label") or it.get("speaker") or None,
+                    "speaker_role": it.get("speaker_role") or None,
+                    "original_text": it.get("original_text") or it.get("text") or "",
+                    "translated_text": it.get("translated_text") or it.get("translatedText") or None,
+                    "detected_language": it.get("detected_language") or None,
+                    "start_time_ms": it.get("start_time_ms"),
+                    "end_time_ms": it.get("end_time_ms"),
+                    "entities": it.get("entities"),
+                    "created_at": it.get("created_at") or _now_iso(),
+                }
+                return TranscriptSegmentRead.model_validate(data)
         raise NotFoundError(f"Transcript segment with id={segment_id} was not found.")
 
     async def update(
@@ -169,8 +199,23 @@ class TranscriptSegmentService(DynamoServiceMixin):
         updates = payload.model_dump(exclude_unset=True)
         merged = {**target, **self.serialize_input(updates)}
         await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
-        clean_item = self.clean(merged)
-        return TranscriptSegmentRead.model_validate(clean_item)
+
+        # Normalize to read model for response
+        data = {
+            "segment_id": str(merged.get("segment_id")),
+            "consultation_id": str(merged.get("consultation_id") or merged.get("consultationId") or ""),
+            "sequence_number": _to_int(merged.get("sequence_number") or merged.get("segmentIndex"), 0),
+            "speaker_label": merged.get("speaker_label") or merged.get("speaker") or None,
+            "speaker_role": merged.get("speaker_role") or None,
+            "original_text": merged.get("original_text") or merged.get("text") or "",
+            "translated_text": merged.get("translated_text") or merged.get("translatedText") or None,
+            "detected_language": merged.get("detected_language") or None,
+            "start_time_ms": merged.get("start_time_ms"),
+            "end_time_ms": merged.get("end_time_ms"),
+            "entities": merged.get("entities"),
+            "created_at": merged.get("created_at") or _now_iso(),
+        }
+        return TranscriptSegmentRead.model_validate(data)
 
     async def delete(self, segment_id: str | UUID) -> None:
         # Fallback: scan to discover legacy keys and then delete by those keys
