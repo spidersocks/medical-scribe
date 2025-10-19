@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import List
-from uuid import UUID
+# from uuid import UUID  # no longer needed for path param
 
 from fastapi import APIRouter, Response, status
 
@@ -20,10 +20,16 @@ router = APIRouter()
     "/consultations/{consultation_id}/segments",
     response_model=List[TranscriptSegmentRead],
 )
-async def list_segments_for_consultation(consultation_id: UUID) -> List[TranscriptSegmentRead]:
-    return await guard_service(
-        transcript_segment_service.list_for_consultation(str(consultation_id))
+async def list_segments_for_consultation(
+    consultation_id: str,  # accept any string id to support non-UUID consultations
+    include_entities: bool = False,  # optional: future enrichment knob
+) -> List[TranscriptSegmentRead]:
+    # We simply pass the string id through; the service already compares as string.
+    segments = await guard_service(
+        transcript_segment_service.list_for_consultation(consultation_id)
     )
+    # If you later add on-demand enrichment, do it here when include_entities is True.
+    return segments
 
 
 @router.post(
@@ -32,31 +38,32 @@ async def list_segments_for_consultation(consultation_id: UUID) -> List[Transcri
     status_code=status.HTTP_201_CREATED,
 )
 async def create_segment_for_consultation(
-    consultation_id: UUID,
+    consultation_id: str,  # accept any string id
     payload: TranscriptSegmentCreate,
 ) -> TranscriptSegmentRead:
-    payload_with_consultation = payload.copy(update={"consultation_id": str(consultation_id)})
+    # Force the path param onto the payload (model will accept string now).
+    payload_with_consultation = payload.copy(update={"consultation_id": consultation_id})
     return await guard_service(
         transcript_segment_service.create(payload_with_consultation)
     )
 
 
 @router.get("/segments/{segment_id}", response_model=TranscriptSegmentRead)
-async def get_segment(segment_id: UUID) -> TranscriptSegmentRead:
-    return await guard_service(transcript_segment_service.get(str(segment_id)))
+async def get_segment(segment_id: str) -> TranscriptSegmentRead:
+    return await guard_service(transcript_segment_service.get(segment_id))
 
 
 @router.patch("/segments/{segment_id}", response_model=TranscriptSegmentRead)
 async def update_segment(
-    segment_id: UUID,
+    segment_id: str,
     payload: TranscriptSegmentUpdate,
 ) -> TranscriptSegmentRead:
     return await guard_service(
-        transcript_segment_service.update(str(segment_id), payload)
+        transcript_segment_service.update(segment_id, payload)
     )
 
 
 @router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_segment(segment_id: UUID) -> Response:
-    await guard_service(transcript_segment_service.delete(str(segment_id)))
+async def delete_segment(segment_id: str) -> Response:
+    await guard_service(transcript_segment_service.delete(segment_id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)

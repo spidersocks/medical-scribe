@@ -8,10 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field, conint, constr
 
 SpeakerField = constr(max_length=50)
 LanguageField = constr(max_length=20)
+ConsultationIdField = constr(min_length=1, max_length=64)  # accept any non-empty id
 
 
 class TranscriptSegmentBase(BaseModel):
-    consultation_id: UUID
+    # Was: consultation_id: UUID
+    consultation_id: ConsultationIdField  # accept string ids (UUID or not)
     sequence_number: conint(ge=0)
     speaker_label: Optional[SpeakerField] = None
     speaker_role: Optional[SpeakerField] = None
