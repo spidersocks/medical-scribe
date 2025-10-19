@@ -71,7 +71,7 @@ class TranscriptSegmentService(DynamoServiceMixin):
             else:
                 entities_list = []
 
-             translated_override = None
+            translated_override = None
             if include_entities:
                 text_en = nlp.to_english(original_text, detected_language)
                 try:
@@ -99,7 +99,7 @@ class TranscriptSegmentService(DynamoServiceMixin):
                 "detected_language": detected_language,
                 "start_time_ms": it.get("start_time_ms"),
                 "end_time_ms": it.get("end_time_ms"),
-                "entities": entities_list,
+                "entities": entities_list,  # ALWAYS a list on read
                 "created_at": created_at,
             }
             normalized.append(TranscriptSegmentRead.model_validate(data))
