@@ -3,13 +3,17 @@ from functools import lru_cache
 from typing import Any
 
 import boto3
-
+from botocore.config import Config  # NEW
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 
+_DDB_CONFIG = Config(  # NEW
+    max_pool_connections=50,
+    retries={"max_attempts": 10, "mode": "standard"},
+)
 
 @lru_cache(maxsize=1)
 def get_session() -> boto3.session.Session:
@@ -21,9 +25,9 @@ def get_session() -> boto3.session.Session:
         kwargs["aws_session_token"] = AWS_SESSION_TOKEN
     return boto3.session.Session(**kwargs)
 
-
 @lru_cache(maxsize=None)
 def get_table(table_name_env: str, default_table_name: str):
     table_name = os.getenv(table_name_env, default_table_name)
-    resource = get_session().resource("dynamodb")
+    # pass Config to resource to increase pool and resilience
+    resource = get_session().resource("dynamodb", config=_DDB_CONFIG)  # NEW
     return resource.Table(table_name)

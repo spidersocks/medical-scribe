@@ -12,6 +12,7 @@ from schemas.clinical_note import (
     ClinicalNoteRead,
     ClinicalNoteUpdate,
 )
+from boto3.dynamodb.conditions import Key  # NEW
 
 
 class ClinicalNoteService(DynamoServiceMixin):
@@ -48,6 +49,23 @@ class ClinicalNoteService(DynamoServiceMixin):
         consultation_id: str | UUID,
     ) -> Optional[ClinicalNoteRead]:
         consultation_id_str = str(consultation_id)
+
+        # Prefer a GSI if present (e.g., IndexName="byConsultationId" with PK=consultation_id)
+        try:
+            response = await run_in_thread(
+                self.table.query,
+                IndexName="byConsultationId",  # provision in Dynamo if not present
+                KeyConditionExpression=Key("consultation_id").eq(consultation_id_str),
+                Limit=1,
+            )
+            items = response.get("Items") or []
+            if items:
+                return ClinicalNoteRead.model_validate(self.clean(items[0]))
+        except Exception:
+            # Fall back to scan if index is not available
+            pass
+
+        # Scan fallback (OK for small scale)
         items = await self.scan_all()
         for item in items:
             if str(item.get("consultation_id")) == consultation_id_str:

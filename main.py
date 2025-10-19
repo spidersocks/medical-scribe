@@ -30,6 +30,7 @@ except ImportError as exc:  # pragma: no cover
         "api_router could not be imported. Ensure your api package exposes `api_router`."
     ) from exc
 
+from starlette.middleware.gzip import GZipMiddleware  # NEW
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stethoscribe-main")
@@ -542,6 +543,9 @@ def register_routes(app: FastAPI) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
+
+    # Gzip compress larger responses (notes, segments lists)
+    app.add_middleware(GZipMiddleware, minimum_size=512)  # NEW
 
     # CORS: be explicit and robust
     allowed = settings.allowed_origins or ["*"]
