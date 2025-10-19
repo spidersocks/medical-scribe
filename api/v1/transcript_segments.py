@@ -49,6 +49,19 @@ async def create_segment_for_consultation(
     )
 
 
+@router.post(
+    "/consultations/{consultation_id}/enrich",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def enrich_segments_for_consultation(
+    consultation_id: str,
+    force: bool = False,
+) -> dict:
+    return await guard_service(
+        transcript_segment_service.enrich_consultation(consultation_id, force=force)
+    )
+
+
 @router.get("/segments/{segment_id}", response_model=TranscriptSegmentRead)
 async def get_segment(segment_id: str) -> TranscriptSegmentRead:
     return await guard_service(transcript_segment_service.get(segment_id))

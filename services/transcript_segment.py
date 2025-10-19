@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import asyncio
+from typing import List, Optional
 from uuid import UUID, uuid4, uuid5, NAMESPACE_DNS
 from datetime import datetime, timezone
 
@@ -92,7 +93,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
         Entities are always returned as a list in the response (UI-compatible).
         """
         cid = str(consultation_id)
-        # Query instead of scan (massive speed-up)
         items = await self._query_segments_for_consultation(cid)
 
         normalized: List[TranscriptSegmentRead] = []
@@ -111,15 +111,13 @@ class TranscriptSegmentService(DynamoServiceMixin):
             detected_language = it.get("detected_language") or None
             created_at = it.get("created_at") or _now_iso()
 
-            # 1) Preferred fast path: expand cached compact entities if present
+            # Preferred fast path: expand cached compact entities if present
             entities_list = _expand_compact(it.get("entities_compact") or [])
-
             translated_override: Optional[str] = None
             entities_ref = it.get("entities_ref")  # "original" or "translated"
 
-            # 2) If include_entities requested and no cached compact exists, compute + cache
+            # Compute only when explicitly requested and missing cache
             if include_entities and not entities_list:
-                # Choose the text we will highlight against
                 if detected_language and not str(detected_language).lower().startswith("en"):
                     text_en = nlp.to_english(original_text, detected_language)
                     translated_override = text_en if text_en and text_en != translated_text else None
@@ -136,32 +134,26 @@ class TranscriptSegmentService(DynamoServiceMixin):
 
                 compact = _compact_from_entities(entities_list)
 
-                # Persist the compact entities and any translated override
+                # Persist compact + translated override
                 try:
                     merged = dict(it)
                     merged["entities_compact"] = compact
                     merged["entities_ref"] = entities_ref
-                    # Keep both camel+snake mirrors consistent
-                    merged["entities"] = None  # we don't store the full verbose list
+                    merged["entities"] = None
                     if translated_override:
                         merged["translated_text"] = translated_override
                         merged["translatedText"] = translated_override
-                    # Ensure legacy keys exist for PK/SK
                     merged["consultationId"] = merged.get("consultationId") or consultation_id_norm
                     merged["segmentIndex"] = merged.get("segmentIndex") or sequence_number
                     await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
-                    # Update local "it" so subsequent code uses the fresh values
                     it = self.clean(merged)
                 except Exception:
-                    # If caching fails, continue serving the computed entities without caching
                     pass
             else:
-                # If compact exists, expand it; decide which text it aligns to for consistency
                 entities_ref = entities_ref or (
                     "translated" if translated_text and not (detected_language or "").lower().startswith("en") else "original"
                 )
 
-            # Ensure a stable segment_id for legacy rows
             seg_id = it.get("segment_id")
             if not seg_id:
                 seg_id = str(uuid5(NAMESPACE_DNS, f"{consultation_id_norm}:{sequence_number}"))
@@ -177,8 +169,7 @@ class TranscriptSegmentService(DynamoServiceMixin):
                 "detected_language": detected_language,
                 "start_time_ms": it.get("start_time_ms"),
                 "end_time_ms": it.get("end_time_ms"),
-                # Always return entities as a list (UI expects BeginOffset/EndOffset etc.)
-                "entities": entities_list,
+                "entities": entities_list,  # list on read
                 "entities_compact": it.get("entities_compact") or None,
                 "entities_ref": entities_ref,
                 "created_at": created_at,
@@ -188,14 +179,86 @@ class TranscriptSegmentService(DynamoServiceMixin):
         normalized.sort(key=lambda x: x.sequence_number)
         return normalized
 
+    async def enrich_consultation(
+        self,
+        consultation_id: str | UUID,
+        *,
+        force: bool = False,
+        concurrency: int = 5,
+    ) -> dict:
+        """
+        Precompute and cache entities_compact (and translated_text if needed) for all segments.
+        Returns counts: total, enriched, skipped.
+        """
+        cid = str(consultation_id)
+        items = await self._query_segments_for_consultation(cid)
+
+        to_enrich = []
+        for it in items:
+            has_compact = bool(it.get("entities_compact"))
+            if force or not has_compact:
+                to_enrich.append(it)
+
+        sem = asyncio.Semaphore(max(1, concurrency))
+        enriched = 0
+
+        async def _enrich_one(it: dict) -> None:
+            nonlocal enriched
+            async with sem:
+                sequence_number = _to_int(it.get("sequence_number") or it.get("segmentIndex"), 0)
+                original_text = it.get("original_text") or it.get("text") or it.get("displayText") or ""
+                detected_language = it.get("detected_language")
+                translated_text = it.get("translated_text") or it.get("translatedText")
+                consultation_id_norm = str(it.get("consultation_id") or it.get("consultationId") or cid)
+
+                # Determine analysis text & ref
+                if detected_language and not str(detected_language).lower().startswith("en"):
+                    text_en = await asyncio.to_thread(nlp.to_english, original_text, detected_language)
+                    translated_override = text_en if text_en and text_en != translated_text else None
+                    analysis_text = text_en
+                    entities_ref = "translated"
+                else:
+                    translated_override = None
+                    analysis_text = original_text
+                    entities_ref = "original"
+
+                try:
+                    entities_list = await asyncio.to_thread(nlp.detect_entities, analysis_text)
+                except Exception:
+                    entities_list = []
+
+                compact = _compact_from_entities(entities_list)
+
+                try:
+                    merged = dict(it)
+                    merged["entities_compact"] = compact
+                    merged["entities_ref"] = entities_ref
+                    merged["entities"] = None
+                    if translated_override:
+                        merged["translated_text"] = translated_override
+                        merged["translatedText"] = translated_override
+                    merged["consultationId"] = merged.get("consultationId") or consultation_id_norm
+                    merged["segmentIndex"] = merged.get("segmentIndex") or sequence_number
+                    await run_in_thread(self.table.put_item, Item=self.serialize_input(merged))
+                    enriched += 1
+                except Exception:
+                    # ignore single-segment failures
+                    pass
+
+        await asyncio.gather(*[_enrich_one(it) for it in to_enrich])
+
+        return {
+            "consultation_id": cid,
+            "total": len(items),
+            "enriched": enriched,
+            "skipped": len(items) - enriched,
+            "force": force,
+        }
+
     async def create(
         self,
         payload: TranscriptSegmentCreate,
     ) -> TranscriptSegmentRead:
-        """
-        Write into the existing table schema (consultationId + segmentIndex).
-        Store snake_case fields for clean reads. We do not persist verbose entities here.
-        """
         data = payload.model_dump()
         consultation_id = str(data.get("consultation_id"))
         if not consultation_id or consultation_id == "None":
@@ -217,12 +280,12 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "speaker_label": data.get("speaker_label"),
             "speaker_role": data.get("speaker_role"),
             "original_text": data.get("original_text") or "",
-            "translated_text": data.get("translated_text"),  # may be provided by the client (zh)
+            "translated_text": data.get("translated_text"),
             "detected_language": data.get("detected_language"),
             "start_time_ms": data.get("start_time_ms"),
             "end_time_ms": data.get("end_time_ms"),
-            # Persist compact slots (empty for now) for future enrichment cache
-            "entities": None,  # do not store verbose entities
+            # Persist compact slots (empty for now)
+            "entities": None,
             "entities_compact": None,
             "entities_ref": None,
             "created_at": created_at,
@@ -246,7 +309,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "detected_language": item.get("detected_language"),
             "start_time_ms": item.get("start_time_ms"),
             "end_time_ms": item.get("end_time_ms"),
-            # Return empty list to UI; enrichment happens on GET with include_entities=true
             "entities": [],
             "entities_compact": None,
             "entities_ref": None,
@@ -255,7 +317,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
         return TranscriptSegmentRead.model_validate(response_data)
 
     async def get(self, segment_id: str | UUID) -> TranscriptSegmentRead:
-        # Query path: scan and match (rarely used). Keep normalized output.
         items = await self.scan_all()
         for it in items:
             if str(it.get("segment_id")) == str(segment_id):
@@ -284,7 +345,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
         segment_id: str | UUID,
         payload: TranscriptSegmentUpdate,
     ) -> TranscriptSegmentRead:
-        # Fallback: scan to find the full item (to get its legacy keys), then replace
         items = await self.scan_all()
         target = None
         for it in items:
@@ -318,7 +378,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
         return TranscriptSegmentRead.model_validate(data)
 
     async def delete(self, segment_id: str | UUID) -> None:
-        # Fallback: scan to discover legacy keys and then delete by those keys
         items = await self.scan_all()
         target = None
         for it in items:
