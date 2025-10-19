@@ -194,6 +194,116 @@ def _get_signature_key(secret_key: str, date_stamp: str, region_name: str, servi
     k_service = hmac.new(k_region, service_name.encode("utf-8"), hashlib.sha256).digest()
     return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
 
+TRANSLATE_MAX_BYTES = 9000  # conservative margin under the 10,000-byte limit
+
+def _utf8_len(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+def _has_cjk(text: str) -> bool:
+    # Same heuristic you already use, factored out
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+def _split_sentences(text: str) -> list[str]:
+    """
+    Split text into sentences while keeping punctuation, covering English and common CJK punctuation.
+    Falls back to whole text if regex fails to split.
+    """
+    # First split on paragraphs to preserve structure
+    paragraphs = re.split(r"\n{2,}", text.strip())
+    out: list[str] = []
+    sent_re = re.compile(r"(.+?[\.!?。！？；;])(\s+|$)", re.S)
+    for para in paragraphs:
+        if _utf8_len(para) <= TRANSLATE_MAX_BYTES:
+            out.append(para.strip())
+            continue
+        # Try sentence-level splitting
+        idx = 0
+        any_match = False
+        for m in sent_re.finditer(para):
+            any_match = True
+            out.append((m.group(1) or "").strip())
+            idx = m.end()
+        # tail
+        if idx < len(para):
+            tail = para[idx:].strip()
+            if tail:
+                out.append(tail)
+        if not any_match and para.strip():
+            out.append(para.strip())
+    return [s for s in out if s]
+
+def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> list[str]:
+    """
+    Build byte-safe chunks <= max_bytes, preferring sentence boundaries.
+    If a single sentence exceeds max_bytes, hard-wrap by bytes.
+    """
+    sentences = _split_sentences(text)
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_bytes = 0
+
+    def flush():
+        nonlocal buf, buf_bytes
+        if buf:
+            chunks.append(" ".join(buf))
+            buf = []
+            buf_bytes = 0
+
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        s_bytes = _utf8_len(s)
+        if s_bytes > max_bytes:
+            # Sentence is too large — split by raw bytes
+            flush()
+            curr = []
+            curr_bytes = 0
+            for ch in s:
+                ch_b = _utf8_len(ch)
+                if curr_bytes + ch_b > max_bytes:
+                    chunks.append("".join(curr))
+                    curr = []
+                    curr_bytes = 0
+                curr.append(ch)
+                curr_bytes += ch_b
+            if curr:
+                chunks.append("".join(curr))
+            continue
+
+        if buf_bytes + (1 if buf else 0) + s_bytes <= max_bytes:
+            buf.append(s)
+            buf_bytes += (1 if buf_bytes else 0) + s_bytes  # account for join space
+        else:
+            flush()
+            buf = [s]
+            buf_bytes = s_bytes
+
+    flush()
+    return chunks
+
+def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
+    """
+    Translate arbitrarily long text by chunking under Amazon Translate limits.
+    """
+    if not text.strip():
+        return text
+    if _utf8_len(text) <= TRANSLATE_MAX_BYTES:
+        # Simple path
+        result = get_translate_client().translate_text(
+            Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
+        )
+        return result["TranslatedText"]
+
+    pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
+    out: list[str] = []
+    for piece in pieces:
+        res = get_translate_client().translate_text(
+            Text=piece, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
+        )
+        out.append(res["TranslatedText"])
+    # Join with double newlines so paragraph boundaries remain readable
+    return "\n\n".join(out)
 
 def build_presigned_url(selected_language: str = "en-US") -> str:
     if not settings.aws_access_key_id or not settings.aws_secret_access_key:
@@ -426,61 +536,116 @@ def register_routes(app: FastAPI) -> None:
         finally:
             logger.info("Browser session ended.")
 
-    @app.post("/generate-final-note")
-    async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
-        full_transcript = payload.full_transcript.strip()
-        if not full_transcript:
-            raise HTTPException(status_code=400, detail="Received an empty transcript.")
+    TRANSLATE_MAX_BYTES = 9000  # conservative margin under the 10,000-byte limit
 
-        logger.info(
-            "Received transcript (%d chars) for note_type=%s",
-            len(full_transcript),
-            payload.note_type,
+def _utf8_len(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+def _has_cjk(text: str) -> bool:
+    # Same heuristic you already use, factored out
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+def _split_sentences(text: str) -> list[str]:
+    """
+    Split text into sentences while keeping punctuation, covering English and common CJK punctuation.
+    Falls back to whole text if regex fails to split.
+    """
+    # First split on paragraphs to preserve structure
+    paragraphs = re.split(r"\n{2,}", text.strip())
+    out: list[str] = []
+    sent_re = re.compile(r"(.+?[\.!?。！？；;])(\s+|$)", re.S)
+    for para in paragraphs:
+        if _utf8_len(para) <= TRANSLATE_MAX_BYTES:
+            out.append(para.strip())
+            continue
+        # Try sentence-level splitting
+        idx = 0
+        any_match = False
+        for m in sent_re.finditer(para):
+            any_match = True
+            out.append((m.group(1) or "").strip())
+            idx = m.end()
+        # tail
+        if idx < len(para):
+            tail = para[idx:].strip()
+            if tail:
+                out.append(tail)
+        if not any_match and para.strip():
+            out.append(para.strip())
+    return [s for s in out if s]
+
+def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> list[str]:
+    """
+    Build byte-safe chunks <= max_bytes, preferring sentence boundaries.
+    If a single sentence exceeds max_bytes, hard-wrap by bytes.
+    """
+    sentences = _split_sentences(text)
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_bytes = 0
+
+    def flush():
+        nonlocal buf, buf_bytes
+        if buf:
+            chunks.append(" ".join(buf))
+            buf = []
+            buf_bytes = 0
+
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        s_bytes = _utf8_len(s)
+        if s_bytes > max_bytes:
+            # Sentence is too large — split by raw bytes
+            flush()
+            curr = []
+            curr_bytes = 0
+            for ch in s:
+                ch_b = _utf8_len(ch)
+                if curr_bytes + ch_b > max_bytes:
+                    chunks.append("".join(curr))
+                    curr = []
+                    curr_bytes = 0
+                curr.append(ch)
+                curr_bytes += ch_b
+            if curr:
+                chunks.append("".join(curr))
+            continue
+
+        if buf_bytes + (1 if buf else 0) + s_bytes <= max_bytes:
+            buf.append(s)
+            buf_bytes += (1 if buf_bytes else 0) + s_bytes  # account for join space
+        else:
+            flush()
+            buf = [s]
+            buf_bytes = s_bytes
+
+    flush()
+    return chunks
+
+def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
+    """
+    Translate arbitrarily long text by chunking under Amazon Translate limits.
+    """
+    if not text.strip():
+        return text
+    if _utf8_len(text) <= TRANSLATE_MAX_BYTES:
+        # Simple path
+        result = get_translate_client().translate_text(
+            Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
         )
+        return result["TranslatedText"]
 
-        patient_info_dict = (
-            payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
+    pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
+    out: list[str] = []
+    for piece in pieces:
+        res = get_translate_client().translate_text(
+            Text=piece, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
         )
-
-        try:
-            if re.search(r"[\u4e00-\u9fff]", full_transcript):
-                logger.info("Detected Chinese characters. Translating to English.")
-                translation = get_translate_client().translate_text(
-                    Text=full_transcript,
-                    SourceLanguageCode="zh",
-                    TargetLanguageCode="en",
-                )
-                english_transcript = translation["TranslatedText"]
-                logger.info("Translation complete. English transcript length=%d.", len(english_transcript))
-            else:
-                english_transcript = full_transcript
-
-            entities_response = get_comprehend_client().detect_entities_v2(Text=english_transcript)
-            entities = entities_response.get("Entities", []) or []
-            logger.info("Comprehend Medical returned %d entities.", len(entities))
-
-            # Compact and trim entities to save tokens
-            ents_compact = _filter_and_compact_entities_for_llm(entities)
-
-            final_note = generate_note_from_scratch(
-                comprehend_json=ents_compact,
-                full_transcript=english_transcript,
-                patient_info=patient_info_dict,
-                note_type=payload.note_type,
-            )
-
-            if payload.note_type == "standard":
-                final_note = _normalize_assessment_plan(
-                    _normalize_empty_sections(_fix_pertinent_negatives(final_note))
-                )
-
-            return {"notes": final_note}
-        except ValueError as exc:
-            logger.error("Note generation error: %s", exc)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.exception("Unexpected error during final note generation.")
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        out.append(res["TranslatedText"])
+    # Join with double newlines so paragraph boundaries remain readable
+    return "\n\n".join(out)
 
     @app.post("/execute-command")
     async def execute_command(payload: CommandPayload) -> Dict[str, str]:
