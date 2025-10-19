@@ -12,7 +12,7 @@ ConsultationIdField = constr(min_length=1, max_length=64)  # accept any non-empt
 
 
 class TranscriptSegmentBase(BaseModel):
-    # Was: consultation_id: UUID
+    # Keep required for read models; will override in Create
     consultation_id: ConsultationIdField  # accept string ids (UUID or not)
     sequence_number: conint(ge=0)
     speaker_label: Optional[SpeakerField] = None
@@ -31,8 +31,10 @@ class TranscriptSegmentBase(BaseModel):
     )
 
 
+# IMPORTANT: Make consultation_id optional for the request body so FastAPI doesn't
+# require it in the JSON. The route will inject the path param afterward.
 class TranscriptSegmentCreate(TranscriptSegmentBase):
-    pass
+    consultation_id: Optional[ConsultationIdField] = None
 
 
 class TranscriptSegmentUpdate(BaseModel):
