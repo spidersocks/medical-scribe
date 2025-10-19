@@ -71,14 +71,17 @@ class TranscriptSegmentService(DynamoServiceMixin):
             else:
                 entities_list = []
 
-            # Enrich on demand
+             translated_override = None
             if include_entities:
                 text_en = nlp.to_english(original_text, detected_language)
                 try:
                     entities_list = nlp.detect_entities(text_en)
                 except Exception:
-                    # If call fails for a segment, keep previous/empty list
                     pass
+                # If we translated (non-English source), surface translated_text so UI can highlight it
+                if detected_language and not str(detected_language).lower().startswith("en"):
+                    if text_en and text_en != original_text:
+                        translated_override = text_en
 
             # Ensure a stable segment_id for legacy rows
             seg_id = it.get("segment_id")
@@ -92,17 +95,14 @@ class TranscriptSegmentService(DynamoServiceMixin):
                 "speaker_label": speaker_label,
                 "speaker_role": it.get("speaker_role") or None,
                 "original_text": original_text,
-                "translated_text": translated_text,
+                "translated_text": translated_override if translated_override is not None else translated_text,
                 "detected_language": detected_language,
                 "start_time_ms": it.get("start_time_ms"),
                 "end_time_ms": it.get("end_time_ms"),
-                "entities": entities_list,  # ALWAYS a list on read
+                "entities": entities_list,
                 "created_at": created_at,
             }
             normalized.append(TranscriptSegmentRead.model_validate(data))
-
-        normalized.sort(key=lambda x: x.sequence_number)
-        return normalized
 
     async def create(
         self,
