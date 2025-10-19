@@ -456,16 +456,14 @@ def register_routes(app: FastAPI) -> None:
                 english_transcript = full_transcript
 
             entities_response = get_comprehend_client().detect_entities_v2(Text=english_transcript)
-            entities = entities_response.get("Entities", [])
+            entities = entities_response.get("Entities", []) or []
             logger.info("Comprehend Medical returned %d entities.", len(entities))
 
-            simplified_entities = [
-                {"Text": entity["Text"], "Category": entity["Category"], "Type": entity["Type"]}
-                for entity in entities
-            ]
+            # Compact and trim entities to save tokens
+            ents_compact = _filter_and_compact_entities_for_llm(entities)
 
             final_note = generate_note_from_scratch(
-                comprehend_json=simplified_entities,
+                comprehend_json=ents_compact,
                 full_transcript=english_transcript,
                 patient_info=patient_info_dict,
                 note_type=payload.note_type,
@@ -640,7 +638,13 @@ def generate_note_from_scratch(
         logger.error("Invalid note type requested: %s", note_type)
         raise ValueError(f"Invalid note type: {note_type}") from exc
 
-    user_payload = json.dumps({"full_transcript": full_transcript, "comprehend_output": comprehend_json})
+    # Compact user payload: transcript + compact entities and summaries
+    user_payload = json.dumps({
+        "full_transcript": full_transcript,
+        "ents": comprehend_json.get("ents", []),
+        "ents_summary": comprehend_json.get("ents_summary", {}),
+        "phi_counts": comprehend_json.get("phi_counts", {}),
+    })
     composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
     body = json.dumps({"prompt": composed_prompt, "max_tokens": 4096, "temperature": 0.1})
 
@@ -713,3 +717,60 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
+
+# ------------------------------
+# LLM token-optimized entity view
+# ------------------------------
+def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Produce a compact, high-signal summary of Comprehend Medical entities for the LLM:
+      - Keep only relyevant categories at high confidence.
+      - Deduplicate b (text.lower(), category, type).
+      - Cap to MAX_ENTS.
+      - Use short keys for each entity: {t, c, y}.
+      - Do NOT include PHI strings; only return PHI counts by Type.
+    """
+    # Tunables
+    SCORE_MIN = 0.90
+    MAX_ENTS = 200
+    ALLOWED = {"MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY"}
+    PHI_CATEGORY = "PROTECTED_HEALTH_INFORMATION"
+
+    ents: List[Dict[str, Any]] = []
+    summary: Dict[str, int] = {}
+    phi_counts: Dict[str, int] = {}
+    seen = set()  # for de-dupe
+
+    for e in raw_entities or []:
+        cat = str(e.get("Category") or "")
+        typ = str(e.get("Type") or "")
+        txt = str(e.get("Text") or "").strip()
+        score = float(e.get("Score") or 0.0)
+        if not txt or score < SCORE_MIN:
+            continue
+
+        if cat == PHI_CATEGORY:
+            # Count PHI by type (no PHI text included)
+            phi_counts[typ] = phi_counts.get(typ, 0) + 1
+            continue
+
+        if cat not in ALLOWED:
+            continue
+
+        key = (txt.lower(), cat, typ)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Compact entity representation
+        ents.append({"t": txt, "c": cat, "y": typ})
+        summary[cat] = summary.get(cat, 0) + 1
+
+        if len(ents) >= MAX_ENTS:
+            break
+
+    # Stable ordering for determinism
+    ents.sort(key=lambda d: (d["c"], d["y"], d["t"]))
+
+    return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
