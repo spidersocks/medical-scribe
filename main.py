@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+Entry point for the backend API.
+
+This file is intentionally conservative: it preserves the existing behaviors while
+making the /note-types route user-aware (optionally returns custom templates for a user).
+It also keeps the Bedrock invocation and generation helpers intact.
+
+NOTE: This is a full-file replacement. Keep other modules (services.*, prompts.*, api.*)
+as-is.
+"""
 import asyncio
 import hashlib
 import hmac
@@ -25,7 +36,7 @@ from starlette.middleware.gzip import GZipMiddleware
 # Application-specific imports
 from prompts import PROMPT_REGISTRY, get_prompt_generator
 
-# Services (template_service will be used to fetch templates)
+# API router and services
 try:
     from api import api_router
 except ImportError as exc:  # pragma: no cover
@@ -753,16 +764,55 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=500, detail=f"Failed to execute command: {exc}") from exc
 
     @app.get("/note-types")
-    async def get_note_types() -> Dict[str, List[Dict[str, str]]]:
-        response = []
+    async def get_note_types(user_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Return available builtin note types and, when user_id is supplied, the user's custom templates.
+
+        Template entries are returned with:
+          - id: "template:<uuid>"
+          - name: template name
+          - description: "Custom template"
+          - source: "template"
+          - template_id: the UUID string
+
+        Builtin prompt modules are returned with:
+          - id: key from PROMPT_REGISTRY (e.g., "standard")
+          - name: module.NOTE_TYPE
+          - description: "Generate a <NOTE_TYPE>"
+          - source: "builtin"
+        """
+        response: List[Dict[str, Any]] = []
+
+        # builtin prompt types
         for key, module in PROMPT_REGISTRY.items():
             response.append(
                 {
                     "id": key,
                     "name": module.NOTE_TYPE,
                     "description": f"Generate a {module.NOTE_TYPE}",
+                    "source": "builtin",
                 }
             )
+
+        # optionally include user templates
+        if user_id and template_service is not None:
+            try:
+                templates = await template_service.list_for_user(str(user_id))
+                for tmpl in templates:
+                    tdict = tmpl.model_dump()
+                    tname = tdict.get("name") or f"Template {tdict.get('id')}"
+                    response.append(
+                        {
+                            "id": f"template:{tdict.get('id')}",
+                            "name": tname,
+                            "description": "Custom template",
+                            "source": "template",
+                            "template_id": str(tdict.get("id")),
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("Could not load templates for user %s: %s", user_id, exc)
+
         return {"note_types": response}
 
 
