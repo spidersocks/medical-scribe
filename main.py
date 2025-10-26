@@ -8,7 +8,7 @@ import re
 import struct
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zlib import crc32
 
@@ -22,8 +22,10 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from starlette.middleware.gzip import GZipMiddleware
 
+# Application-specific imports
 from prompts import PROMPT_REGISTRY, get_prompt_generator
 
+# Services (template_service will be used to fetch templates)
 try:
     from api import api_router
 except ImportError as exc:  # pragma: no cover
@@ -31,13 +33,21 @@ except ImportError as exc:  # pragma: no cover
         "api_router could not be imported. Ensure your api package exposes `api_router`."
     ) from exc
 
+try:
+    from services import template_service
+except Exception:
+    # template_service may not be present in some test contexts; surface error later if used
+    template_service = None  # type: ignore
 
+# ---- logging ----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stethoscribe-main")
 
+# ---- load env ----
 load_dotenv()
 
 
+# ---- Settings ----
 class Settings(BaseModel):
     aws_region: str = "us-east-1"
     aws_access_key_id: Optional[str] = None
@@ -62,7 +72,7 @@ class Settings(BaseModel):
 
 settings = Settings.from_env()
 
-
+# ---- AWS clients lazily created ----
 @lru_cache(maxsize=1)
 def get_boto3_session() -> boto3.session.Session:
     kwargs: Dict[str, Any] = {"region_name": settings.aws_region}
@@ -89,6 +99,7 @@ def get_translate_client():
     return get_boto3_session().client("translate")
 
 
+# ---- Models for routes ----
 class PatientInfo(BaseModel):
     name: Optional[str] = None
     sex: Optional[str] = None
@@ -101,6 +112,7 @@ class FinalNotePayload(BaseModel):
     full_transcript: str
     patient_info: Optional[PatientInfo] = None
     note_type: str = "standard"
+    template_id: Optional[str] = None  # optional: reference to a saved template
 
 
 class CommandPayload(BaseModel):
@@ -108,6 +120,7 @@ class CommandPayload(BaseModel):
     command: str
 
 
+# ---- Event stream utilities (AWS Transcribe proxy) ----
 def _encode_event_stream(headers: Dict[str, str], payload: bytes) -> bytes:
     headers_payload = b""
     for header_name, header_value in headers.items():
@@ -184,26 +197,17 @@ class EventStreamParser:
                 break
 
 
-def _sign(key: bytes, msg: str) -> bytes:
-    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+# ---- Translation helpers (large-text chunking) ----
+TRANSLATE_MAX_BYTES = 9000  # margin under 10,000 bytes
 
-
-def _get_signature_key(secret_key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
-    k_date = _sign(("AWS4" + secret_key).encode("utf-8"), date_stamp)
-    k_region = hmac.new(k_date, region_name.encode("utf-8"), hashlib.sha256).digest()
-    k_service = hmac.new(k_region, service_name.encode("utf-8"), hashlib.sha256).digest()
-    return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
-
-
-# ---------- Long-text translation helpers (chunking under Translate limits) ----------
-
-TRANSLATE_MAX_BYTES = 9000  # margin under the 10,000-byte limit
 
 def _utf8_len(s: str) -> int:
     return len(s.encode("utf-8"))
 
+
 def _has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
+
 
 def _split_sentences(text: str) -> List[str]:
     paragraphs = re.split(r"\n{2,}", text.strip())
@@ -226,6 +230,7 @@ def _split_sentences(text: str) -> List[str]:
         if not any_match and para.strip():
             out.append(para.strip())
     return [s for s in out if s]
+
 
 def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> List[str]:
     sentences = _split_sentences(text)
@@ -272,6 +277,7 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
     flush()
     return chunks
 
+
 def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
     if not text.strip():
         return text
@@ -291,106 +297,8 @@ def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
     return "\n\n".join(out)
 
 
-# ---------- Prompting / note generation ----------
-
-def generate_note_from_scratch(
-    comprehend_json: Dict[str, Any],
-    full_transcript: str,
-    patient_info: Optional[Dict[str, Any]],
-    note_type: str,
-) -> Dict[str, Any]:
-    try:
-        prompt_module = get_prompt_generator(note_type)
-        logger.info("Generating %s note via modular prompt system.", prompt_module.NOTE_TYPE)
-        system_prompt = prompt_module.generate_prompt(patient_info)
-    except ValueError as exc:
-        logger.error("Invalid note type requested: %s", note_type)
-        raise ValueError(f"Invalid note type: {note_type}") from exc
-
-    user_payload = json.dumps({
-        "full_transcript": full_transcript,
-        "ents": comprehend_json.get("ents", []),
-        "ents_summary": comprehend_json.get("ents_summary", {}),
-        "phi_counts": comprehend_json.get("phi_counts", {}),
-    })
-    composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
-    body = json.dumps({"prompt": composed_prompt, "max_tokens": 4096, "temperature": 0.1})
-
-    try:
-        response = get_bedrock_client().invoke_model(
-            body=body,
-            modelId=settings.bedrock_model_id,
-            accept="application/json",
-            contentType="application/json",
-        )
-        response_body = json.loads(response.get("body").read())
-        model_output = response_body.get("outputs", [{}])[0].get("text", "")
-        stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
-
-        try:
-            start_index = model_output.find("{")
-            if start_index == -1:
-                raise ValueError("Could not find JSON object in Bedrock response.")
-
-            json_substring = model_output[start_index:].strip()
-
-            if json_substring.startswith("```"):
-                lines = json_substring.split("\n")
-                json_substring = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-
-            brace_level = 0
-            last_brace_index = -1
-            for idx, char in enumerate(json_substring):
-                if char == "{":
-                    brace_level += 1
-                elif char == "}":
-                    brace_level -= 1
-                    if brace_level == 0:
-                        last_brace_index = idx
-            if last_brace_index != -1:
-                json_substring = json_substring[: last_brace_index + 1]
-            elif not json_substring.endswith("}"):
-                json_substring += "}"
-
-            json_substring = re.sub(r'"text:\s*"', '"text": "', json_substring)
-            json_substring = re.sub(r'"(\w+):\s*', r'"\1": ', json_substring)
-
-            parsed = json.loads(json_substring)
-            logger.info("Successfully generated note with %d top-level sections.", len(parsed))
-            return parsed
-        except (ValueError, json.JSONDecodeError) as exc:
-            logger.warning("Initial JSON parse failed: %s. Attempting repair.", exc)
-            try:
-                # Simple repair attempts
-                repaired = json_substring
-                if 'text:' in repaired:
-                    repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
-                repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
-                parsed = json.loads(repaired)
-                logger.info("Successfully parsed JSON after repair step.")
-                return parsed
-            except Exception as repair_error:
-                error_msg = (
-                    "Failed to parse JSON from final note even after repair. "
-                    f"Stop Reason: {stop_reason}. Original error: {exc}. "
-                    f"Repair error: {repair_error}. Full Generation: '{model_output}'"
-                )
-                raise ValueError(error_msg) from repair_error
-    except Exception as exc:
-        if isinstance(exc, ValueError):
-            raise
-        raise ValueError(f"Bedrock invocation failed: {exc}") from exc
-
-
+# ---- Entity compaction for LLM prompts ----
 def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Produce a compact, high-signal summary of Comprehend Medical entities for the LLM:
-      - Keep only relevant categories at high confidence.
-      - Deduplicate by (text.lower(), category, type).
-      - Cap to MAX_ENTS.
-      - Use short keys for each entity: {t, c, y}.
-      - Do NOT include PHI strings; only return PHI counts by Type.
-    """
     SCORE_MIN = 0.90
     MAX_ENTS = 200
     ALLOWED = {"MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY"}
@@ -431,76 +339,155 @@ def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> 
     return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
 
 
-# ---------- Routes ----------
+# ---- Bedrock invocation + robust JSON extraction helpers ----
+def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:
+    """
+    Attempt to extract the main JSON substring from model output; returns (substring, error_message)
+    """
+    if not text:
+        return "", "Empty model output"
 
-def build_presigned_url(selected_language: str = "en-US") -> str:
-    if not settings.aws_access_key_id or not settings.aws_secret_access_key:
-        raise RuntimeError(
-            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required to build the Transcribe presigned URL."
+    start_index = text.find("{")
+    if start_index == -1:
+        return "", "Could not find JSON object in model output."
+
+    json_substring = text[start_index:].strip()
+
+    # strip fenced codeblock markers if present
+    if json_substring.startswith("```"):
+        lines = json_substring.split("\n")
+        # remove triple-backticks lines
+        if lines and lines[-1].strip() == "```":
+            json_substring = "\n".join(lines[1:-1])
+        else:
+            json_substring = "\n".join(lines[1:])
+
+    # trim to matching braces if possible
+    brace_level = 0
+    last_brace_index = -1
+    for idx, ch in enumerate(json_substring):
+        if ch == "{":
+            brace_level += 1
+        elif ch == "}":
+            brace_level -= 1
+            if brace_level == 0:
+                last_brace_index = idx
+                break
+    if last_brace_index != -1:
+        json_substring = json_substring[: last_brace_index + 1]
+    elif not json_substring.endswith("}"):
+        json_substring += "}"
+
+    return json_substring, None
+
+
+def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
+    """
+    Try to fix common mistakes and parse JSON. Raises JSONDecodeError or ValueError on failure.
+    """
+    s = json_substring
+    # Quick pattern fixes observed from LLM outputs
+    s = re.sub(r'"text:\s*"', '"text": "', s)
+    s = re.sub(r'"(\w+):\s*', r'"\1": ', s)
+    parsed = json.loads(s)
+    return parsed
+
+
+def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens: int = 4096, temperature: float = 0.1) -> Dict[str, Any]:
+    """
+    Invokes Bedrock model with composed prompt and returns parsed JSON object.
+    This wraps the existing robust logic and raises ValueError on parse/invocation errors.
+    """
+    composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
+    body = json.dumps({"prompt": composed_prompt, "max_tokens": max_tokens, "temperature": temperature})
+
+    try:
+        response = get_bedrock_client().invoke_model(
+            body=body,
+            modelId=settings.bedrock_model_id,
+            accept="application/json",
+            contentType="application/json",
         )
+    except Exception as exc:
+        raise ValueError(f"Bedrock invocation failed: {exc}") from exc
 
-    if selected_language in ("zh-HK", "zh-TW"):
-        language_options = f"{selected_language},en-US"
-    else:
-        language_options = "en-US,zh-HK"
+    try:
+        response_body = json.loads(response.get("body").read())
+        model_output = response_body.get("outputs", [{}])[0].get("text", "")
+        stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
+    except Exception as exc:
+        raise ValueError(f"Failed to read Bedrock response: {exc}") from exc
 
-    method = "GET"
-    service = "transcribe"
-    host = f"transcribestreaming.{settings.aws_region}.amazonaws.com:8443"
-    endpoint = f"wss://{host}/stream-transcription-websocket"
+    json_substring, find_err = _find_json_substring(model_output)
+    if find_err:
+        raise ValueError(find_err + f" Raw output: {model_output[:500]}")
 
-    timestamp = datetime.now(timezone.utc)
-    amz_date = timestamp.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = timestamp.strftime("%Y%m%d")
-    canonical_uri = "/stream-transcription-websocket"
-
-    query_params = {
-        "identify-multiple-languages": "true",
-        "language-options": language_options,
-        "preferred-language": language_options.split(",", 1)[0],
-        "show-speaker-label": "true",
-        "media-encoding": "pcm",
-        "sample-rate": "16000",
-        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-        "X-Amz-Credential": f"{settings.aws_access_key_id}/{date_stamp}/{settings.aws_region}/{service}/aws4_request",
-        "X-Amz-Date": amz_date,
-        "X-Amz-Expires": "300",
-        "X-Amz-SignedHeaders": "host",
-    }
-
-    if settings.aws_session_token:
-        query_params["X-Amz-Security-Token"] = settings.aws_session_token
-
-    canonical_querystring = "&".join(
-        f"{key}={quote(str(value), safe='~')}" for key, value in sorted(query_params.items())
-    )
-    canonical_headers = f"host:{host}\n"
-    signed_headers = "host"
-    payload_hash = hashlib.sha256(b"").hexdigest()
-
-    canonical_request = (
-        f"{method}\n"
-        f"{canonical_uri}\n"
-        f"{canonical_querystring}\n"
-        f"{canonical_headers}\n"
-        f"{signed_headers}\n"
-        f"{payload_hash}"
-    )
-
-    credential_scope = f"{date_stamp}/{settings.aws_region}/{service}/aws4_request"
-    string_to_sign = (
-        "AWS4-HMAC-SHA256\n"
-        f"{amz_date}\n"
-        f"{credential_scope}\n"
-        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
-    )
-
-    signing_key = _get_signature_key(settings.aws_secret_access_key, date_stamp, settings.aws_region, service)
-    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    return f"{endpoint}?{canonical_querystring}&X-Amz-Signature={signature}"
+    try:
+        parsed = _repair_and_parse_json(json_substring)
+        logger.info("Successfully parsed JSON from model output with %d top-level keys.", len(parsed))
+        return parsed
+    except Exception as exc:
+        # try an additional repair pass
+        try:
+            repaired = json_substring
+            if 'text:' in repaired:
+                repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
+            repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
+            parsed = json.loads(repaired)
+            logger.info("Parsed JSON after secondary repair.")
+            return parsed
+        except Exception as repair_error:
+            raise ValueError(
+                "Failed to parse JSON from final note even after repair. "
+                f"Stop Reason: {stop_reason}. Original error: {exc}. Repair error: {repair_error}. Full output: '{model_output[:1000]}'"
+            ) from repair_error
 
 
+def generate_note_from_system_prompt(system_prompt: str, full_transcript: str, comprehend_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    High-level wrapper to prepare user payload and call Bedrock + parsing.
+    """
+    user_payload = json.dumps({
+        "full_transcript": full_transcript,
+        "ents": comprehend_json.get("ents", []),
+        "ents_summary": comprehend_json.get("ents_summary", {}),
+        "phi_counts": comprehend_json.get("phi_counts", {}),
+    })
+    return _invoke_bedrock_and_parse(system_prompt, user_payload)
+
+
+def _prepare_template_instructions(template_item: Dict[str, Any]) -> str:
+    """
+    Convert a template (TemplateRead.model_dump()) into an instruction block
+    that biases the LLM to produce a note following that template structure.
+    """
+    parts: List[str] = []
+    name = template_item.get("name") or "Custom Template"
+    parts.append(f"Template: {name}")
+    parts.append("Structure:")
+    sections = template_item.get("sections") or []
+    if isinstance(sections, str):
+        try:
+            sections = json.loads(sections)
+        except Exception:
+            sections = []
+
+    for idx, s in enumerate(sections, start=1):
+        if not isinstance(s, dict):
+            continue
+        sec_name = s.get("name") or s.get("title") or f"Section {idx}"
+        sec_desc = s.get("description") or s.get("desc") or ""
+        parts.append(f"{idx}. {sec_name}: {sec_desc}")
+
+    example_text = template_item.get("example_text") or template_item.get("exampleNoteText") or ""
+    if example_text:
+        parts.append("\nExample note text (for style / tone):")
+        parts.append(example_text.strip()[:8000])  # truncate to avoid token blowups
+
+    return "\n".join(parts)
+
+
+# -------- Routes registration (includes WebSocket proxy) --------
 def register_routes(app: FastAPI) -> None:
     @app.websocket("/client-transcribe")
     async def client_transcribe(ws: WebSocket) -> None:
@@ -510,16 +497,7 @@ def register_routes(app: FastAPI) -> None:
         if language_code not in {"en-US", "zh-HK", "zh-TW"}:
             language_code = "en-US"
 
-        if language_code in {"zh-HK", "zh-TW"}:
-            language_options_log = f"{language_code},en-US"
-        else:
-            language_options_log = "en-US,zh-HK"
-
-        logger.info(
-            "Browser connected. Selected language=%s. Using language-options=%s",
-            language_code,
-            language_options_log,
-        )
+        logger.info("Browser connected. Selected language=%s", language_code)
 
         try:
             aws_url = build_presigned_url(selected_language=language_code)
@@ -667,9 +645,10 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="Received an empty transcript.")
 
         logger.info(
-            "Received transcript (%d chars) for note_type=%s",
+            "Received transcript (%d chars) for note_type=%s template_id=%s",
             len(full_transcript),
             payload.note_type,
+            getattr(payload, "template_id", None),
         )
 
         patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
@@ -689,13 +668,32 @@ def register_routes(app: FastAPI) -> None:
             logger.info("Comprehend Medical returned %d entities.", len(entities))
             ents_compact = _filter_and_compact_entities_for_llm(entities)
 
-            # Generate note via prompt system
-            final_note = generate_note_from_scratch(
-                comprehend_json=ents_compact,
-                full_transcript=english_transcript,
-                patient_info=patient_info_dict,
-                note_type=payload.note_type,
-            )
+            # Determine base system prompt for the requested note type
+            try:
+                prompt_module = get_prompt_generator(payload.note_type)
+                base_system_prompt = prompt_module.generate_prompt(patient_info_dict)
+            except Exception as e:
+                logger.warning("Unknown note type '%s': %s. Falling back to standard prompt.", payload.note_type, e)
+                prompt_module = get_prompt_generator("standard")
+                base_system_prompt = prompt_module.generate_prompt(patient_info_dict)
+
+            # Optionally augment with template instructions when template_id is provided
+            final_system_prompt = base_system_prompt
+            if getattr(payload, "template_id", None):
+                if not template_service:
+                    raise HTTPException(status_code=400, detail="Template support not available on server.")
+                try:
+                    template_obj = await template_service.get(str(payload.template_id))
+                    template_dict = template_obj.model_dump()
+                    template_instructions = _prepare_template_instructions(template_dict)
+                    final_system_prompt = f"{template_instructions}\n\n{base_system_prompt}"
+                    logger.info("Using template %s to augment system prompt.", template_dict.get("id"))
+                except Exception as exc:
+                    logger.exception("Failed to fetch/prepare template: %s", exc)
+                    raise HTTPException(status_code=400, detail=f"Could not load template: {exc}") from exc
+
+            # Generate note using composed system prompt
+            final_note = generate_note_from_system_prompt(final_system_prompt, english_transcript, ents_compact)
 
             # Optional normalization for "standard"
             if payload.note_type == "standard":
@@ -768,34 +766,76 @@ def register_routes(app: FastAPI) -> None:
         return {"note_types": response}
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
+# ---- helper utilities for presigned transcribe URL ----
+def build_presigned_url(selected_language: str = "en-US") -> str:
+    if not settings.aws_access_key_id or not settings.aws_secret_access_key:
+        raise RuntimeError(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required to build the Transcribe presigned URL."
+        )
 
-    app.add_middleware(GZipMiddleware, minimum_size=512)
+    if selected_language in ("zh-HK", "zh-TW"):
+        language_options = f"{selected_language},en-US"
+    else:
+        language_options = "en-US,zh-HK"
 
-    allowed = settings.allowed_origins or ["*"]
-    allow_credentials = False if "*" in allowed else True
-    logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
+    method = "GET"
+    service = "transcribe"
+    host = f"transcribestreaming.{settings.aws_region}.amazonaws.com:8443"
+    endpoint = f"wss://{host}/stream-transcription-websocket"
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed,
-        allow_credentials=allow_credentials,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        max_age=86400,
+    timestamp = datetime.now(timezone.utc)
+    amz_date = timestamp.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = timestamp.strftime("%Y%m%d")
+    canonical_uri = "/stream-transcription-websocket"
+
+    query_params = {
+        "identify-multiple-languages": "true",
+        "language-options": language_options,
+        "preferred-language": language_options.split(",", 1)[0],
+        "show-speaker-label": "true",
+        "media-encoding": "pcm",
+        "sample-rate": "16000",
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{settings.aws_access_key_id}/{date_stamp}/{settings.aws_region}/{service}/aws4_request",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": "300",
+        "X-Amz-SignedHeaders": "host",
+    }
+
+    if settings.aws_session_token:
+        query_params["X-Amz-Security-Token"] = settings.aws_session_token
+
+    canonical_querystring = "&".join(
+        f"{key}={quote(str(value), safe='~')}" for key, value in sorted(query_params.items())
+    )
+    canonical_headers = f"host:{host}\n"
+    signed_headers = "host"
+    payload_hash = hashlib.sha256(b"").hexdigest()
+
+    canonical_request = (
+        f"{method}\n"
+        f"{canonical_uri}\n"
+        f"{canonical_querystring}\n"
+        f"{canonical_headers}\n"
+        f"{signed_headers}\n"
+        f"{payload_hash}"
     )
 
-    # Prevent Starlette's automatic trailing-slash redirect responses.
-    # This avoids a browser preflight/redirect round-trip that can drop CORS headers.
-    # Clients can still call routes with or without trailing slash; the router will match the exact path.
-    app.router.redirect_slashes = False
+    credential_scope = f"{date_stamp}/{settings.aws_region}/{service}/aws4_request"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n"
+        f"{credential_scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
 
-    app.include_router(api_router)
-    register_routes(app)
-    return app
+    signing_key = _get_signature_key(settings.aws_secret_access_key, date_stamp, settings.aws_region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    return f"{endpoint}?{canonical_querystring}&X-Amz-Signature={signature}"
 
 
+# ---- small normalization helpers used after LLM output ----
 def _normalize_assessment_plan(note: Dict[str, Any]) -> Dict[str, Any]:
     ap_section = note.get("Assessment and Plan")
     if isinstance(ap_section, str):
@@ -833,6 +873,34 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
                 note[section] = "None"
 
     return note
+
+
+# ---- App creation ----
+def create_app() -> FastAPI:
+    app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
+
+    app.add_middleware(GZipMiddleware, minimum_size=512)
+
+    allowed = settings.allowed_origins or ["*"]
+    allow_credentials = False if "*" in allowed else True
+    logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        max_age=86400,
+    )
+
+    # Avoid automatic trailing-slash redirect responses which can break CORS preflight flows
+    app.router.redirect_slashes = False
+
+    # include API router and register additional bespoke routes
+    app.include_router(api_router)
+    register_routes(app)
+    return app
 
 
 app = create_app()
