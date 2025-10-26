@@ -786,6 +786,11 @@ def create_app() -> FastAPI:
         max_age=86400,
     )
 
+    # Prevent Starlette's automatic trailing-slash redirect responses.
+    # This avoids a browser preflight/redirect round-trip that can drop CORS headers.
+    # Clients can still call routes with or without trailing slash; the router will match the exact path.
+    app.router.redirect_slashes = False
+
     app.include_router(api_router)
     register_routes(app)
     return app
