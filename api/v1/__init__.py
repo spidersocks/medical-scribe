@@ -6,6 +6,7 @@ from . import (
     patients,
     transcript_segments,
     users,
+    templates,  # <-- added: import the templates module
 )
 
 api_router = APIRouter()
@@ -15,3 +16,5 @@ api_router.include_router(patients.router, prefix="/patients", tags=["patients"]
 api_router.include_router(consultations.router, prefix="/consultations", tags=["consultations"])
 api_router.include_router(transcript_segments.router, prefix="/transcript-segments", tags=["transcript-segments"])
 api_router.include_router(clinical_notes.router, prefix="/clinical-notes", tags=["clinical-notes"])
+# register templates router
+api_router.include_router(templates.router, prefix="/templates", tags=["templates"])

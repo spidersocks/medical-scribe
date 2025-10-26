@@ -4,6 +4,7 @@ from services.exceptions import NotFoundError, ServiceError, ValidationError
 from services.patient import patient_service
 from services.transcript_segment import transcript_segment_service
 from services.user import user_service
+from .template_service import template_service
 
 __all__ = [
     "NotFoundError",

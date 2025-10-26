@@ -13,9 +13,12 @@ from schemas.template import TemplateCreate, TemplateRead, TemplateUpdate
 
 class TemplateService(DynamoServiceMixin):
     async def list_for_user(self, owner_user_id: str) -> List[TemplateRead]:
-        # For small scale we can scan then filter by owner_user_id (keeping consistent with other services)
         items = await self.scan_all()
-        filtered = [item for item in items if str(item.get("ownerUserId") or item.get("owner_user_id") or "") == owner_user_id]
+        filtered = [
+            item
+            for item in items
+            if str(item.get("ownerUserId") or item.get("owner_user_id") or "") == owner_user_id
+        ]
         return [TemplateRead.model_validate(item) for item in filtered]
 
     async def create(self, owner_user_id: str, payload: TemplateCreate) -> TemplateRead:
@@ -55,7 +58,6 @@ class TemplateService(DynamoServiceMixin):
                 ExpressionAttributeNames={"#pk": self.partition_key},
             )
         except ClientError as exc:
-            # Mirror other services' NotFound handling
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise NotFoundError(f"Template with id={template_id} was not found.") from exc
             raise
