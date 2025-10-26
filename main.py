@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-Entry point for the backend API.
-
-This file is intentionally conservative: it preserves the existing behaviors while
-making the /note-types route user-aware (optionally returns custom templates for a user).
-It also keeps the Bedrock invocation and generation helpers intact.
-
-NOTE: This is a full-file replacement. Keep other modules (services.*, prompts.*, api.*)
-as-is.
-"""
 import asyncio
 import hashlib
 import hmac
@@ -22,7 +11,6 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zlib import crc32
-import html
 
 import aiohttp
 import boto3
@@ -125,6 +113,8 @@ class FinalNotePayload(BaseModel):
     patient_info: Optional[PatientInfo] = None
     note_type: str = "standard"
     template_id: Optional[str] = None  # optional: reference to a saved template
+    encounter_time: Optional[str] = None  # ISO timestamp the frontend records at end of transcript
+    encounter_type: Optional[str] = None  # e.g., "in-person" or "telehealth"
 
 
 class CommandPayload(BaseModel):
@@ -418,7 +408,7 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
     except Exception:
         logger.debug("COMPOSED PROMPT (could not stringify)")
 
-    body = json.dumps({"prompt": composed_prompt, "max_tokens": max_tokens, "temperature": temperature})
+    body = json.dumps({"prompt": composed_prompt, "max_tokens": max_tokens, "temperature": temperature}, ensure_ascii=False)
 
     try:
         response = get_bedrock_client().invoke_model(
@@ -472,17 +462,35 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
             raise ValueError(error_msg) from repair_error
 
 
-def generate_note_from_system_prompt(system_prompt: str, full_transcript: str, comprehend_json: Dict[str, Any], temperature: float = 0.1) -> Dict[str, Any]:
+def generate_note_from_system_prompt(
+    system_prompt: str,
+    full_transcript: str,
+    comprehend_json: Dict[str, Any],
+    patient_info: Optional[Dict[str, Any]] = None,
+    encounter_time: Optional[str] = None,
+    encounter_type: Optional[str] = None,
+    temperature: float = 0.1,
+) -> Dict[str, Any]:
     """
     High-level wrapper to prepare user payload and call Bedrock + parsing.
-    Accepts temperature so callers can request deterministic output when using templates.
+    Adds patient_info and encounter metadata to the user payload so the LLM can
+    reference them explicitly (in addition to any patient context embedded in the system prompt).
     """
-    user_payload = json.dumps({
+    user_payload_obj = {
         "full_transcript": full_transcript,
         "ents": comprehend_json.get("ents", []),
         "ents_summary": comprehend_json.get("ents_summary", {}),
         "phi_counts": comprehend_json.get("phi_counts", {}),
-    })
+    }
+
+    if patient_info:
+        user_payload_obj["patient_info"] = patient_info
+    if encounter_time:
+        user_payload_obj["encounter_time"] = encounter_time
+    if encounter_type:
+        user_payload_obj["encounter_type"] = encounter_type
+
+    user_payload = json.dumps(user_payload_obj, ensure_ascii=False)
     return _invoke_bedrock_and_parse(system_prompt, user_payload, max_tokens=4096, temperature=temperature)
 
 
@@ -497,7 +505,7 @@ def _prepare_template_instructions(template_item: dict) -> str:
       exactly match the template section names. The model is told to return ONLY
       the JSON object (no surrounding explanation).
     """
-    parts = []
+    parts: List[str] = []
     name = template_item.get("name") or "Custom Template"
     parts.append(f"Template: {name}")
     parts.append("Structure (section name: description):")
@@ -509,7 +517,7 @@ def _prepare_template_instructions(template_item: dict) -> str:
         except Exception:
             sections = []
 
-    section_names = []
+    section_names: List[Dict[str, str]] = []
     for idx, s in enumerate(sections, start=1):
         if not isinstance(s, dict):
             continue
@@ -520,37 +528,27 @@ def _prepare_template_instructions(template_item: dict) -> str:
 
     example_text = template_item.get("example_text") or template_item.get("exampleNoteText") or ""
     if example_text:
-        # keep a short excerpt
         parts.append("\nExample note text (style / tone excerpt):")
-        excerpt = example_text.strip()
-        parts.append(excerpt[:2000])
+        parts.append(example_text.strip()[:2000])
 
     # Build explicit JSON skeleton using the exact section names.
-    # For each section, prefer "array of objects with text" for list-like sections,
-    # otherwise allow a string. This is conservative and easy for the model to follow.
     skeleton = {}
     for s in section_names:
-        # Choose array skeleton as default (more flexible). The LLM may return string
-        # for narrative sections; we instruct allowed types below.
-        skeleton[s["name"]] = []  # empty array of objects is explicit and machine-friendly
+        skeleton[s["name"]] = []  # default to array-of-objects skeleton for clarity
 
     parts.append("\nOUTPUT FORMAT (REQUIRED):")
     parts.append(
         "Return a single, valid JSON object and NOTHING ELSE. The object MUST have keys exactly "
         "matching the section names below (names are case-sensitive). For list sections return "
-        "an array of objects like [{\"text\": \"...\"}]. For narrative sections return a string. "
+        'an array of objects like [{"text": "..."}]. For narrative sections return a string. '
         "Do NOT include commentary, notes, or explanation — ONLY the JSON."
     )
 
-    # Pretty JSON skeleton for clarity
     try:
-        skeleton_example = {
-            k: [{"text": ""}] for k in skeleton.keys()
-        }
+        skeleton_example = {k: [{"text": ""}] for k in skeleton.keys()}
         parts.append("Example JSON skeleton (you must follow keys exactly):")
         parts.append(json.dumps(skeleton_example, indent=2, ensure_ascii=False))
     except Exception:
-        # fallback to a textual list
         parts.append("Sections: " + ", ".join(skeleton.keys()))
 
     parts.append("\nIf a section is truly not applicable, set its value to the string \"None\" (without quotes).")
@@ -751,6 +749,7 @@ def register_routes(app: FastAPI) -> None:
 
             # Optionally augment with template instructions when template_id is provided
             final_system_prompt = base_system_prompt
+            temperature = 0.1  # default temperature
             if getattr(payload, "template_id", None):
                 if not template_service:
                     raise HTTPException(status_code=400, detail="Template support not available on server.")
@@ -758,14 +757,38 @@ def register_routes(app: FastAPI) -> None:
                     template_obj = await template_service.get(str(payload.template_id))
                     template_dict = template_obj.model_dump()
                     template_instructions = _prepare_template_instructions(template_dict)
-                    final_system_prompt = f"{template_instructions}\n\n{base_system_prompt}"
+
+                    # Place template instructions after the base prompt and add a strict header to increase compliance
+                    final_system_prompt = (
+                        f"{base_system_prompt}\n\n"
+                        "TEMPLATE INSTRUCTIONS (FOLLOW THESE EXACTLY):\n"
+                        f"{template_instructions}\n\n"
+                        "STRICT REQUIREMENT: Return ONLY a single valid JSON object that matches the template keys exactly. Do not include any extra text or explanation."
+                    )
+
+                    # Lower temperature for more deterministic, template-compliant output
+                    temperature = 0.0
+
                     logger.info("Using template %s to augment system prompt.", template_dict.get("id"))
                 except Exception as exc:
                     logger.exception("Failed to fetch/prepare template: %s", exc)
                     raise HTTPException(status_code=400, detail=f"Could not load template: {exc}") from exc
 
-            # Generate note using composed system prompt
-            final_note = generate_note_from_system_prompt(final_system_prompt, english_transcript, ents_compact)
+            # Determine encounter_time to pass to the LLM:
+            # Prefer payload.encounter_time if provided, else leave None (frontend includes it when available)
+            encounter_time = getattr(payload, "encounter_time", None)
+            encounter_type = getattr(payload, "encounter_type", None)
+
+            # Generate note using composed system prompt and pass patient/encounter metadata
+            final_note = generate_note_from_system_prompt(
+                final_system_prompt,
+                english_transcript,
+                ents_compact,
+                patient_info=patient_info_dict,
+                encounter_time=encounter_time,
+                encounter_type=encounter_type,
+                temperature=temperature,
+            )
 
             # Optional normalization for "standard"
             if payload.note_type == "standard":
@@ -795,7 +818,7 @@ def register_routes(app: FastAPI) -> None:
             "formatting, explanation, or markdown."
         )
 
-        note_as_string = json.dumps(payload.note_content, indent=2)
+        note_as_string = json.dumps(payload.note_content, indent=2, ensure_ascii=False)
         user_prompt = (
             f"Here is the clinical note:\n```json\n{note_as_string}\n```\n\n"
             f"Here is my command: \"{payload.command}\"\n\n"
@@ -803,7 +826,8 @@ def register_routes(app: FastAPI) -> None:
         )
 
         bedrock_body = json.dumps(
-            {"prompt": f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:", "max_tokens": 2048, "temperature": 0.2}
+            {"prompt": f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:", "max_tokens": 2048, "temperature": 0.2},
+            ensure_ascii=False
         )
 
         try:
