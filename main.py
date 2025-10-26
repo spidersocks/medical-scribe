@@ -22,6 +22,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zlib import crc32
+import html
 
 import aiohttp
 import boto3
@@ -407,9 +408,16 @@ def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
 def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens: int = 4096, temperature: float = 0.1) -> Dict[str, Any]:
     """
     Invokes Bedrock model with composed prompt and returns parsed JSON object.
-    This wraps the existing robust logic and raises ValueError on parse/invocation errors.
+    Adds helpful logging of the prompt and model output (truncated) for debugging.
     """
     composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
+    # Log truncated prompt for debugging (avoid logging full patient PHI in production)
+    try:
+        safe_prompt = composed_prompt.replace("\n", "\\n")
+        logger.debug("COMPOSED PROMPT (truncated 4000 chars): %s", safe_prompt[:4000])
+    except Exception:
+        logger.debug("COMPOSED PROMPT (could not stringify)")
+
     body = json.dumps({"prompt": composed_prompt, "max_tokens": max_tokens, "temperature": temperature})
 
     try:
@@ -429,16 +437,23 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
     except Exception as exc:
         raise ValueError(f"Failed to read Bedrock response: {exc}") from exc
 
+    # Log model output truncated for debugging
+    try:
+        logger.debug("MODEL OUTPUT (truncated 2000 chars): %s", (model_output or "")[:2000])
+    except Exception:
+        logger.debug("MODEL OUTPUT (could not stringify)")
+
     json_substring, find_err = _find_json_substring(model_output)
     if find_err:
-        raise ValueError(find_err + f" Raw output: {model_output[:500]}")
+        # If we couldn't even find a JSON start, include snippet in error to aid debugging
+        raise ValueError(find_err + f" Raw model output (first 1000 chars): {model_output[:1000]}")
 
     try:
         parsed = _repair_and_parse_json(json_substring)
         logger.info("Successfully parsed JSON from model output with %d top-level keys.", len(parsed))
         return parsed
     except Exception as exc:
-        # try an additional repair pass
+        # attempt a repair and include the model_output snippet in the error for debugging
         try:
             repaired = json_substring
             if 'text:' in repaired:
@@ -448,15 +463,19 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
             logger.info("Parsed JSON after secondary repair.")
             return parsed
         except Exception as repair_error:
-            raise ValueError(
+            # Provide rich debugging context in the raised error
+            error_msg = (
                 "Failed to parse JSON from final note even after repair. "
-                f"Stop Reason: {stop_reason}. Original error: {exc}. Repair error: {repair_error}. Full output: '{model_output[:1000]}'"
-            ) from repair_error
+                f"Stop Reason: {stop_reason}. Initial parse error: {exc}. Repair error: {repair_error}. "
+                f"Full model output (first 2000 chars): '{model_output[:2000]}'"
+            )
+            raise ValueError(error_msg) from repair_error
 
 
-def generate_note_from_system_prompt(system_prompt: str, full_transcript: str, comprehend_json: Dict[str, Any]) -> Dict[str, Any]:
+def generate_note_from_system_prompt(system_prompt: str, full_transcript: str, comprehend_json: Dict[str, Any], temperature: float = 0.1) -> Dict[str, Any]:
     """
     High-level wrapper to prepare user payload and call Bedrock + parsing.
+    Accepts temperature so callers can request deterministic output when using templates.
     """
     user_payload = json.dumps({
         "full_transcript": full_transcript,
@@ -464,18 +483,25 @@ def generate_note_from_system_prompt(system_prompt: str, full_transcript: str, c
         "ents_summary": comprehend_json.get("ents_summary", {}),
         "phi_counts": comprehend_json.get("phi_counts", {}),
     })
-    return _invoke_bedrock_and_parse(system_prompt, user_payload)
+    return _invoke_bedrock_and_parse(system_prompt, user_payload, max_tokens=4096, temperature=temperature)
 
 
-def _prepare_template_instructions(template_item: Dict[str, Any]) -> str:
+def _prepare_template_instructions(template_item: dict) -> str:
     """
-    Convert a template (TemplateRead.model_dump()) into an instruction block
-    that biases the LLM to produce a note following that template structure.
+    Convert the TemplateRead dict into a human-readable but strict instruction block
+    that biases the LLM to produce a JSON note that matches the template sections.
+
+    The block contains:
+    - A human summary of sections and their descriptions.
+    - A required OUTPUT FORMAT section with an explicit JSON skeleton where keys
+      exactly match the template section names. The model is told to return ONLY
+      the JSON object (no surrounding explanation).
     """
-    parts: List[str] = []
+    parts = []
     name = template_item.get("name") or "Custom Template"
     parts.append(f"Template: {name}")
-    parts.append("Structure:")
+    parts.append("Structure (section name: description):")
+
     sections = template_item.get("sections") or []
     if isinstance(sections, str):
         try:
@@ -483,17 +509,52 @@ def _prepare_template_instructions(template_item: Dict[str, Any]) -> str:
         except Exception:
             sections = []
 
+    section_names = []
     for idx, s in enumerate(sections, start=1):
         if not isinstance(s, dict):
             continue
-        sec_name = s.get("name") or s.get("title") or f"Section {idx}"
-        sec_desc = s.get("description") or s.get("desc") or ""
+        sec_name = (s.get("name") or s.get("title") or f"Section {idx}").strip()
+        sec_desc = (s.get("description") or s.get("desc") or "").strip()
         parts.append(f"{idx}. {sec_name}: {sec_desc}")
+        section_names.append({"name": sec_name, "description": sec_desc})
 
     example_text = template_item.get("example_text") or template_item.get("exampleNoteText") or ""
     if example_text:
-        parts.append("\nExample note text (for style / tone):")
-        parts.append(example_text.strip()[:8000])  # truncate to avoid token blowups
+        # keep a short excerpt
+        parts.append("\nExample note text (style / tone excerpt):")
+        excerpt = example_text.strip()
+        parts.append(excerpt[:2000])
+
+    # Build explicit JSON skeleton using the exact section names.
+    # For each section, prefer "array of objects with text" for list-like sections,
+    # otherwise allow a string. This is conservative and easy for the model to follow.
+    skeleton = {}
+    for s in section_names:
+        # Choose array skeleton as default (more flexible). The LLM may return string
+        # for narrative sections; we instruct allowed types below.
+        skeleton[s["name"]] = []  # empty array of objects is explicit and machine-friendly
+
+    parts.append("\nOUTPUT FORMAT (REQUIRED):")
+    parts.append(
+        "Return a single, valid JSON object and NOTHING ELSE. The object MUST have keys exactly "
+        "matching the section names below (names are case-sensitive). For list sections return "
+        "an array of objects like [{\"text\": \"...\"}]. For narrative sections return a string. "
+        "Do NOT include commentary, notes, or explanation — ONLY the JSON."
+    )
+
+    # Pretty JSON skeleton for clarity
+    try:
+        skeleton_example = {
+            k: [{"text": ""}] for k in skeleton.keys()
+        }
+        parts.append("Example JSON skeleton (you must follow keys exactly):")
+        parts.append(json.dumps(skeleton_example, indent=2, ensure_ascii=False))
+    except Exception:
+        # fallback to a textual list
+        parts.append("Sections: " + ", ".join(skeleton.keys()))
+
+    parts.append("\nIf a section is truly not applicable, set its value to the string \"None\" (without quotes).")
+    parts.append("Do not invent additional top-level keys. Order of keys does not matter, but keys must match.")
 
     return "\n".join(parts)
 
