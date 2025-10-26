@@ -15,4 +15,5 @@ __all__ = [
     "consultation_service",
     "transcript_segment_service",
     "clinical_note_service",
+    "template_service",
 ]

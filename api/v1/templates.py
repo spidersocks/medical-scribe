@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, status, Response
 
 from api.deps import guard_service
 from schemas.template import TemplateCreate, TemplateRead, TemplateUpdate
@@ -34,6 +34,6 @@ async def update_template(template_id: UUID, payload: TemplateUpdate) -> Templat
 
 
 @router.delete("/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_template(template_id: UUID):
+async def delete_template(template_id: UUID) -> Response:
     await guard_service(template_service.delete(str(template_id)))
-    return {}, status.HTTP_204_NO_CONTENT
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
