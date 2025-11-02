@@ -27,6 +27,23 @@ def _spk_label_from_tag(speaker_tag: Optional[int]) -> Optional[str]:
         return None
     return f"spk_{max(0, speaker_tag - 1)}"
 
+def _dur_to_seconds(ts) -> float:
+    """
+    Convert GCP WordInfo timestamps (which may be google.protobuf Duration or datetime.timedelta)
+    into a float seconds value.
+    """
+    if ts is None:
+        return 0.0
+    # datetime.timedelta case
+    try:
+        return float(ts.total_seconds())  # works if timedelta
+    except Exception:
+        pass
+    # protobuf Duration case (has seconds and nanos)
+    secs = float(getattr(ts, "seconds", 0) or 0)
+    nanos = float(getattr(ts, "nanos", 0) or 0)
+    return secs + nanos / 1e9
+
 
 # ---- GCP Translation (v3) ----
 
@@ -125,6 +142,7 @@ def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> spee
         max_speaker_count=2,
     )
 
+    # IMPORTANT: do not set use_enhanced/model to allow alternative_language_codes with v1
     recog = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=16000,
@@ -132,8 +150,8 @@ def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> spee
         alternative_language_codes=alt_langs,
         enable_automatic_punctuation=True,
         enable_word_time_offsets=True,
-        use_enhanced=True,
-        model="phone_call",  # pragmatic choice for 2-speaker conversations
+        # use_enhanced=True,
+        # model="phone_call",
         diarization_config=diarization,
     )
 
@@ -147,8 +165,8 @@ def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> spee
 def _words_to_items(words: List[speech.WordInfo]) -> List[Dict]:
     items = []
     for w in words or []:
-        start = (w.start_time.seconds or 0) + (w.start_time.nanos or 0) / 1e9
-        end = (w.end_time.seconds or 0) + (w.end_time.nanos or 0) / 1e9
+        start = _dur_to_seconds(getattr(w, "start_time", None))
+        end = _dur_to_seconds(getattr(w, "end_time", None))
         items.append(
             {
                 "StartTime": round(start, 3),
