@@ -27,9 +27,8 @@ SPECIFIC_INSTRUCTIONS = """
 - Keep it concise and organized by SOAP structure
 """
 
-def generate_prompt(patient_info: dict = None) -> str:
-    """Generate the complete system prompt for SOAP notes."""
-    patient_context = build_patient_context(patient_info)
+def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> str:
+    patient_context = build_patient_context(patient_info, encounter_time)
     
     return f"""You are an AI medical scribe specialized in SOAP note documentation. Your task is to transform a conversation transcript into a perfectly structured SOAP note in JSON format. Your response must be a single, valid JSON object and nothing else.
 {patient_context}

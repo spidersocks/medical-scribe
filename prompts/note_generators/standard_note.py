@@ -40,9 +40,8 @@ SPECIFIC_INSTRUCTIONS = """
 - Assessment and Plan should group related items under single problem numbers
 """
 
-def generate_prompt(patient_info: dict = None) -> str:
-    """Generate the complete system prompt for standard clinical notes."""
-    patient_context = build_patient_context(patient_info)
+def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> str:
+    patient_context = build_patient_context(patient_info, encounter_time)
     
     return f"""You are an AI medical scribe with the reasoning ability of a senior clinician. Your task is to transform a conversation transcript into a perfectly structured, factually accurate clinical note in JSON format. Your response must be a single, valid JSON object and nothing else.
 {patient_context}

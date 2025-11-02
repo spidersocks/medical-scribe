@@ -95,9 +95,8 @@ SPECIFIC_INSTRUCTIONS = """
 - If vital signs or exam findings aren't mentioned in the transcript, omit that section rather than saying "Not documented"
 """
 
-def generate_prompt(patient_info: dict = None) -> str:
-    """Generate the complete system prompt for H&P notes."""
-    patient_context = build_patient_context(patient_info)
+def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> str:
+    patient_context = build_patient_context(patient_info, encounter_time)
     
     return f"""You are an AI medical scribe specialized in creating comprehensive History and Physical (H&P) documentation for hospital admissions. Your task is to transform a conversation transcript into a perfectly structured H&P note in JSON format. Your response must be a single, valid JSON object and nothing else.
 {patient_context}

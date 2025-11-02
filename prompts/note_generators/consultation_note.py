@@ -97,9 +97,8 @@ SPECIFIC_INSTRUCTIONS = """
 - Always offer continued involvement and availability
 """
 
-def generate_prompt(patient_info: dict = None) -> str:
-    """Generate the complete system prompt for consultation notes."""
-    patient_context = build_patient_context(patient_info)
+def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> str:
+    patient_context = build_patient_context(patient_info, encounter_time)
     
     return f"""You are an AI medical scribe specialized in creating consultation notes. Your task is to transform a conversation transcript into a perfectly structured consultation note in JSON format, written from the perspective of a consulting specialist providing expert recommendations. Your response must be a single, valid JSON object and nothing else.
 {patient_context}

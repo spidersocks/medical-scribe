@@ -1,23 +1,24 @@
 # prompts/base.py
 
-def build_patient_context(patient_info: dict) -> str:
+def build_patient_context(patient_info: dict, encounter_time: str = None) -> str:
     """Build the patient information context block used across all note types."""
-    if not patient_info:
+    if not patient_info and not encounter_time:
         return ""
     
     context_parts = []
-    if patient_info.get("name"):
-        context_parts.append(f"Patient Name: {patient_info['name']}")
-    if patient_info.get("age") and patient_info.get("sex"):
-        context_parts.append(f"Age/Sex: {patient_info['age']}-year-old {patient_info['sex']}")
-    elif patient_info.get("age"):
-        context_parts.append(f"Age: {patient_info['age']} years old")
-    elif patient_info.get("sex"):
-        context_parts.append(f"Sex: {patient_info['sex']}")
-    if patient_info.get("referring_physician"):
-        context_parts.append(f"Referring Physician: {patient_info['referring_physician']}")
-    if patient_info.get("additional_context"):
-        context_parts.append(f"Additional Context: {patient_info['additional_context']}")
+    if patient_info:
+        if patient_info.get("age") and patient_info.get("sex"):
+            context_parts.append(f"Age/Sex: {patient_info['age']}-year-old {patient_info['sex']}")
+        elif patient_info.get("age"):
+            context_parts.append(f"Age: {patient_info['age']} years old")
+        elif patient_info.get("sex"):
+            context_parts.append(f"Sex: {patient_info['sex']}")
+        if patient_info.get("referring_physician"):
+            context_parts.append(f"Referring Physician: {patient_info['referring_physician']}")
+        if patient_info.get("additional_context"):
+            context_parts.append(f"Additional Context: {patient_info['additional_context']}")
+    if encounter_time:
+        context_parts.append(f"Encounter Time: {encounter_time}")
     
     if context_parts:
         return "\n\n**PATIENT INFORMATION:**\n" + "\n".join(context_parts)
