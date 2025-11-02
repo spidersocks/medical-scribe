@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from __future__ import annotations
 
+import asyncio  # NEW: Import the asyncio library
 from typing import List, Optional, Tuple
 from uuid import UUID, uuid4, uuid5, NAMESPACE_DNS
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from schemas.transcript_segment import (
     TranscriptSegmentUpdate,
 )
 from services import nlp  # translate + comprehend
-import time  # NEW
+import time
 
 _CACHE_TTL = 2.0  # seconds
 _SEGMENTS_CACHE: dict[tuple[str, bool], tuple[float, list[dict]]] = {}  # (cid, include_entities) -> (ts, serialized list)
@@ -312,24 +313,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
             "translatedText": data.get("translated_text"),
         }
         await run_in_thread(self.table.put_item, Item=self.serialize_input(item))
-        response_data = {
-            "segment_id": segment_id,
-            "consultation_id": consultation_id,
-            "sequence_number": segment_index,
-            "speaker_label": item.get("speaker_label"),
-            "speaker_role": item.get("speaker_role"),
-            "original_text": item.get("original_text") or "",
-            "translated_text": item.get("translated_text"),
-            "detected_language": item.get("detected_language"),
-            "start_time_ms": item.get("start_time_ms"),
-            "end_time_ms": item.get("end_time_ms"),
-            "entities": [],
-            "entities_compact": None,
-            "entities_ref": None,
-            "created_at": created_at,
-        }
-        return TranscriptSegmentRead.model_validate(response_data)
-
         response_data = {
             "segment_id": segment_id,
             "consultation_id": consultation_id,
