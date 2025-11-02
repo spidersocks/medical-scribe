@@ -12,6 +12,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zlib import crc32
 
+try:
+    from services.gcp_streaming import register_gcp_streaming_routes
+except Exception:
+    register_gcp_streaming_routes = None  # type: ignore
+
 import aiohttp
 import boto3
 import uvicorn
@@ -1029,12 +1034,22 @@ def create_app() -> FastAPI:
         max_age=86400,
     )
 
-    # Avoid automatic trailing-slash redirect responses which can break CORS preflight flows
     app.router.redirect_slashes = False
 
-    # include API router and register additional bespoke routes
     app.include_router(api_router)
     register_routes(app)
+
+    # NEW: register Google STT streaming endpoint
+    if register_gcp_streaming_routes:
+        try:
+            gcp_project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")
+            register_gcp_streaming_routes(app, gcp_project_id=gcp_project_id)
+            logger.info("Registered /client-transcribe-gcp endpoint (GCP Speech).")
+        except Exception as exc:
+            logger.warning("Failed to register GCP streaming route: %s", exc)
+    else:
+        logger.info("GCP streaming module not available; /client-transcribe-gcp not registered.")
+
     return app
 
 
