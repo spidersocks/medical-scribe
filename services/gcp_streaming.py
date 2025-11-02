@@ -38,28 +38,56 @@ def _get_translate_client() -> translate.TranslationServiceClient:
         _translate_client = translate.TranslationServiceClient()
     return _translate_client
 
-def _translate_to_english(text: str, project_id: Optional[str] = None, location: str = "global") -> str:
+def _map_asr_lang_to_translate_source(asr_code: Optional[str]) -> str:
+    """
+    Map Speech-to-Text detected language -> Cloud Translation source language code.
+    Goal: ensure Cantonese (yue-Hant-HK) uses a Traditional Chinese path (zh-TW) instead of generic auto.
+    """
+    if not asr_code:
+        return "auto"
+    code = asr_code.lower()
+    if code.startswith("en"):
+        return "en"
+    # Cantonese (Traditional, Hong Kong)
+    if code.startswith("yue-hant-hk"):
+        return "zh-TW"
+    # Mandarin (Traditional script, Taiwan)
+    if code.startswith("cmn-hant-tw"):
+        return "zh-TW"
+    # Mandarin (Simplified script, Mainland) if ever enabled
+    if code.startswith("cmn-hans-cn") or code.startswith("zh-cn"):
+        return "zh-CN"
+    # Generic Chinese fallback: prefer Traditional in HK deployments
+    if code.startswith("zh") or "hant" in code or "hans" in code:
+        return "zh-TW"
+    return "auto"
+
+def _translate_to_english(
+    text: str,
+    project_id: Optional[str] = None,
+    location: str = "global",
+    source_lang: Optional[str] = None,
+) -> str:
     """
     Translate arbitrary text to English using Cloud Translation v3.
-    - If you have a project id in env (GOOGLE_CLOUD_PROJECT), you can pass it through main and fill here.
+    - source_lang: explicit source (e.g., 'zh-TW') to avoid auto-detect skew.
     """
     if not text.strip():
         return text
     parent = f"projects/{project_id or '-'}/locations/{location}"
+    req = {
+        "parent": parent,
+        "contents": [text],
+        "mime_type": "text/plain",
+        "source_language_code": source_lang or "auto",
+        "target_language_code": "en",
+    }
     try:
-        resp = _get_translate_client().translate_text(
-            request={
-                "parent": parent,
-                "contents": [text],
-                "mime_type": "text/plain",
-                "source_language_code": "auto",
-                "target_language_code": "en",
-            }
-        )
+        resp = _get_translate_client().translate_text(request=req)
         if resp and resp.translations:
             return resp.translations[0].translated_text or text
     except Exception as exc:
-        logger.warning("GCP Translation failed, returning original. Error: %s", exc)
+        logger.warning("GCP Translation failed (src=%s). Returning original. Error: %s", source_lang or "auto", exc)
     return text
 
 
@@ -180,8 +208,13 @@ def _normalize_to_aws_like_payload(
         if detected_lang.lower().startswith("en"):
             english_text = transcript_text
         else:
-            # Use GCP Translate v3
-            english_text = _translate_to_english(transcript_text, project_id_for_translate)
+            # Use GCP Translate v3 with explicit source language mapped from ASR
+            source_lang = _map_asr_lang_to_translate_source(detected_lang)
+            english_text = _translate_to_english(
+                transcript_text,
+                project_id_for_translate,
+                source_lang=source_lang,
+            )
             if english_text and english_text != transcript_text:
                 payload["TranslatedText"] = english_text
 
@@ -201,7 +234,8 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
     forward normalized messages to the browser.
 
     Query param:
-      - language_code in { "en-US", "zh-HK", "zh-TW" } used as primary hint.
+      - language_code in { "auto", "en-US", "zh-HK", "zh-TW" }.
+        "auto" (or missing) opens all three without asking the user.
 
     Notes:
       - Audio frames must be 16kHz PCM16 mono (the existing AudioWorklet already sends that).
@@ -211,25 +245,29 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
     async def client_transcribe_gcp(ws: WebSocket):
         await ws.accept()
 
-        # Map UI codes -> GCP language codes
-        primary_ui = ws.query_params.get("language_code", "en-US")
-        if primary_ui not in {"en-US", "zh-HK", "zh-TW"}:
-            primary_ui = "en-US"
+        # Accept "auto" (or missing) to open all 3 languages
+        primary_ui = ws.query_params.get("language_code", "auto")
+        if not primary_ui:
+            primary_ui = "auto"
 
+        # Default: open all languages; primary is required by API so choose a neutral default
         primary = "en-US"
-        alts: List[str] = []
+        alts: List[str] = ["yue-Hant-HK", "cmn-Hant-TW"]
+        mode = "auto"
 
-        if primary_ui == "en-US":
-            primary = "en-US"
-            alts = ["yue-Hant-HK", "cmn-Hant-TW"]
-        elif primary_ui == "zh-HK":
-            primary = "yue-Hant-HK"
-            alts = ["en-US", "cmn-Hant-TW"]
-        elif primary_ui == "zh-TW":
-            primary = "cmn-Hant-TW"
-            alts = ["en-US", "yue-Hant-HK"]
+        if primary_ui in {"en-US", "zh-HK", "zh-TW"}:
+            mode = primary_ui
+            if primary_ui == "en-US":
+                primary = "en-US"
+                alts = ["yue-Hant-HK", "cmn-Hant-TW"]
+            elif primary_ui == "zh-HK":
+                primary = "yue-Hant-HK"
+                alts = ["en-US", "cmn-Hant-TW"]
+            elif primary_ui == "zh-TW":
+                primary = "cmn-Hant-TW"
+                alts = ["en-US", "yue-Hant-HK"]
 
-        logger.info("GCP WS connected. Primary=%s, Alts=%s", primary, alts)
+        logger.info("GCP WS connected. Mode=%s | Primary=%s | Alts=%s", mode, primary, alts)
 
         speech_client = speech.SpeechClient()
         stream_cfg = _build_gcp_streaming_config(primary, alts)
