@@ -198,7 +198,9 @@ def _normalize_to_aws_like_payload(
                     "LanguageCode": detected_lang,
                 }
             ]
-        }
+        },
+        "_engine": "gcp",                 # <-- stamp engine
+        "_detected_language": detected_lang,  # optional but useful for debugging
     }
 
     if is_final and transcript_text.strip():

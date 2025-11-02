@@ -676,14 +676,20 @@ def register_routes(app: FastAPI) -> None:
                                 try:
                                     results = payload.get("Transcript", {}).get("Results", [])
                                     if not results:
-                                        continue
-
-                                    result = results[0]
-                                    if result.get("IsPartial", True):
+                                        # mark even partials so the UI can log engine
+                                        payload["_engine"] = "aws"
                                         if ws.client_state == WebSocketState.CONNECTED:
                                             await ws.send_text(json.dumps(payload))
                                         continue
 
+                                    result = results[0]
+                                    if result.get("IsPartial", True):
+                                        payload["_engine"] = "aws"
+                                        if ws.client_state == WebSocketState.CONNECTED:
+                                            await ws.send_text(json.dumps(payload))
+                                        continue
+
+                                    # Final segment processing...
                                     original_text = result.get("Alternatives", [{}])[0].get("Transcript", "")
                                     if not original_text:
                                         continue
@@ -705,6 +711,7 @@ def register_routes(app: FastAPI) -> None:
 
                                     entities = get_comprehend_client().detect_entities_v2(Text=english_text)
                                     payload["ComprehendEntities"] = entities.get("Entities", [])
+                                    payload["_engine"] = "aws"  # <-- stamp here for finals too
                                     logger.info(
                                         "Processed final segment (%s). Entities=%d",
                                         detected_language,
