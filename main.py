@@ -561,6 +561,16 @@ def _prepare_template_instructions(template_item: dict) -> str:
 
     return "\n".join(parts)
 
+def _sign(key: bytes, msg: str) -> bytes:
+    import hmac, hashlib
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+def _get_signature_key(secret_key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
+    kDate = _sign(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    kRegion = _sign(kDate, region_name)
+    kService = _sign(kRegion, service_name)
+    kSigning = _sign(kService, "aws4_request")
+    return kSigning
 
 # -------- Routes registration (includes WebSocket proxy) --------
 def register_routes(app: FastAPI) -> None:
