@@ -4,7 +4,6 @@ import logging
 import re
 import uuid
 import queue
-import itertools
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket
@@ -17,8 +16,6 @@ from services import nlp  # reuse Comprehend Medical via AWS for English NER
 
 logger = logging.getLogger("stethoscribe-gcp")
 
-# ---- Basic helpers ----
-
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 def _has_cjk(text: str) -> bool:
@@ -30,9 +27,6 @@ def _spk_label_from_tag(speaker_tag: Optional[int]) -> Optional[str]:
     return f"spk_{max(0, speaker_tag - 1)}"
 
 def _dur_to_seconds(ts) -> float:
-    """
-    Convert GCP WordInfo timestamps (google.protobuf Duration or datetime.timedelta) to seconds.
-    """
     if ts is None:
         return 0.0
     try:
@@ -43,9 +37,6 @@ def _dur_to_seconds(ts) -> float:
     nanos = float(getattr(ts, "nanos", 0) or 0)
     return secs + nanos / 1e9
 
-
-# ---- GCP Translation (v3) ----
-
 _translate_client: Optional[translate.TranslationServiceClient] = None
 
 def _get_translate_client() -> translate.TranslationServiceClient:
@@ -55,32 +46,22 @@ def _get_translate_client() -> translate.TranslationServiceClient:
     return _translate_client
 
 def _map_asr_lang_to_translate_source(asr_code: Optional[str]) -> str:
-    """
-    Map Speech-to-Text detected language -> Cloud Translation source language code.
-    Ensure Cantonese uses Traditional Chinese path; bias Traditional for HK.
-    """
     if not asr_code:
         return "auto"
     code = asr_code.lower()
-
     if code.startswith("en"):
         return "en"
-    if code.startswith("yue-hant-hk"):  # Cantonese (Traditional, HK)
+    if code.startswith("yue-hant-hk"):
         return "zh-TW"
-    if code.startswith("zh-tw") or "hant" in code:  # Traditional Chinese
+    if code.startswith("zh-tw") or "hant" in code:
         return "zh-TW"
-    if code.startswith("zh-cn") or "hans" in code:  # Simplified Chinese
+    if code.startswith("zh-cn") or "hans" in code:
         return "zh-CN"
     if code.startswith("zh"):
         return "zh-TW"
     return "auto"
 
-def _translate_to_english(
-    text: str,
-    project_id: Optional[str] = None,
-    location: str = "global",
-    source_lang: Optional[str] = None,
-) -> str:
+def _translate_to_english(text: str, project_id: Optional[str] = None, location: str = "global", source_lang: Optional[str] = None) -> str:
     if not text.strip():
         return text
     parent = f"projects/{project_id or '-'}/locations/{location}"
@@ -99,14 +80,7 @@ def _translate_to_english(
         logger.warning("GCP Translation failed (src=%s). Returning original. Error: %s", source_lang or "auto", exc)
     return text
 
-
-# ---- GCP Speech streaming plumbing ----
-
 class _QueueBytesSource:
-    """
-    Bridges WS audio bytes into a blocking generator read by Speech client in a worker thread.
-    Uses thread-safe queue.Queue to avoid cross-thread asyncio issues.
-    """
     def __init__(self):
         self._q: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._closed = False
@@ -123,35 +97,42 @@ class _QueueBytesSource:
         self._closed = True
 
     def audio_requests(self):
-        """
-        Yield audio_content requests. The StreamingRecognitionConfig is passed separately to the API.
-        Runs in a worker thread and blocks on queue.get().
-        """
         while True:
             item = self._q.get()
             if item is None:
                 break
             yield speech.StreamingRecognizeRequest(audio_content=item)
 
-
 def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> speech.StreamingRecognitionConfig:
-    """
-    IMPORTANT: Do NOT set use_enhanced/model with alt languages in v1; many enhanced models reject alt codes.
-    """
     diarization = speech.SpeakerDiarizationConfig(
         enable_speaker_diarization=True,
         min_speaker_count=2,
         max_speaker_count=2,
     )
 
+    # Light phrase hints to stabilize English medical terms and common Cantonese tokens.
+    speech_contexts = [
+        speech.SpeechContext(
+            phrases=[
+                # English medical/common terms
+                "metformin", "lisinopril", "prednisone", "glucose", "blood pressure",
+                "shortness of breath", "chest pain", "budesonide", "spirometer",
+                # Cantonese common words in HK clinical speech (Traditional)
+                "醫生", "病人", "糖尿", "抽血", "藥", "呼吸", "痛", "行十五分鐘", "覆診",
+            ],
+            boost=10.0,
+        )
+    ]
+
     recog = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=16000,
         language_code=primary_lang,
-        alternative_language_codes=alt_langs,  # e.g., ["en-US","yue-Hant-HK","zh-TW"]
+        alternative_language_codes=alt_langs,
         enable_automatic_punctuation=True,
         enable_word_time_offsets=True,
         diarization_config=diarization,
+        speech_contexts=speech_contexts,
     )
 
     return speech.StreamingRecognitionConfig(
@@ -159,7 +140,6 @@ def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> spee
         interim_results=True,
         single_utterance=False,
     )
-
 
 def _words_to_items(words: List[speech.WordInfo]) -> List[Dict]:
     items = []
@@ -177,11 +157,7 @@ def _words_to_items(words: List[speech.WordInfo]) -> List[Dict]:
         )
     return items
 
-
-def _normalize_to_aws_like_payload(
-    result: speech.StreamingRecognitionResult,
-    project_id_for_translate: Optional[str],
-) -> Dict:
+def _normalize_to_aws_like_payload(result: speech.StreamingRecognitionResult, project_id_for_translate: Optional[str]) -> Dict:
     is_final = bool(result.is_final)
     alt = result.alternatives[0] if result.alternatives else None
     transcript_text = alt.transcript if alt else ""
@@ -196,9 +172,7 @@ def _normalize_to_aws_like_payload(
         "Transcript": {
             "Results": [
                 {
-                    "Alternatives": [
-                        {"Transcript": transcript_text, "Items": items}
-                    ],
+                    "Alternatives": [{"Transcript": transcript_text, "Items": items}],
                     "ResultId": str(uuid.uuid4()),
                     "IsPartial": not is_final,
                     "LanguageCode": detected_lang,
@@ -209,23 +183,17 @@ def _normalize_to_aws_like_payload(
         "_detected_language": detected_lang,
     }
 
-    # Avoid emitting empty finals (prevents blank segments/422s)
     if is_final and not transcript_text.strip():
         payload["Transcript"]["Results"][0]["IsPartial"] = True
         return payload
 
     if is_final and transcript_text.strip():
         payload["DisplayText"] = transcript_text
-
         if detected_lang.lower().startswith("en"):
             english_text = transcript_text
         else:
             source_lang = _map_asr_lang_to_translate_source(detected_lang)
-            english_text = _translate_to_english(
-                transcript_text,
-                project_id_for_translate,
-                source_lang=source_lang,
-            )
+            english_text = _translate_to_english(transcript_text, project_id_for_translate, source_lang=source_lang)
             if english_text and english_text != transcript_text:
                 payload["TranslatedText"] = english_text
 
@@ -237,34 +205,31 @@ def _normalize_to_aws_like_payload(
 
     return payload
 
-
 def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str] = None) -> None:
     @app.websocket("/client-transcribe-gcp")
     async def client_transcribe_gcp(ws: WebSocket):
         await ws.accept()
 
         primary_ui = ws.query_params.get("language_code", "auto") or "auto"
+        bias = (ws.query_params.get("bias") or "").lower()  # NEW: optional bias=en|yue|zh
 
-        # Bias "auto" toward Chinese pickup (Cantonese primary improves CJK detection)
-        if primary_ui == "auto":
-            primary = "yue-Hant-HK"
-            alts: List[str] = ["en-US", "zh-TW"]  # use zh-TW (v1 supported), not cmn-Hant-TW
-            mode = "auto"
+        # Choose primary/alts
+        if bias == "en":
+            primary, alts, mode = "en-US", ["yue-Hant-HK", "zh-TW"], "bias=en"
+        elif bias == "yue":
+            primary, alts, mode = "yue-Hant-HK", ["en-US", "zh-TW"], "bias=yue"
+        elif bias == "zh":
+            primary, alts, mode = "zh-TW", ["en-US", "yue-Hant-HK"], "bias=zh"
         else:
-            mode = primary_ui
+            # language_code override if provided; otherwise default to Cantonese primary for auto
             if primary_ui == "en-US":
-                primary = "en-US"
-                alts = ["yue-Hant-HK", "zh-TW"]
+                primary, alts, mode = "en-US", ["yue-Hant-HK", "zh-TW"], "en-US"
             elif primary_ui == "zh-HK":
-                primary = "yue-Hant-HK"
-                alts = ["en-US", "zh-TW"]
+                primary, alts, mode = "yue-Hant-HK", ["en-US", "zh-TW"], "zh-HK"
             elif primary_ui == "zh-TW":
-                primary = "zh-TW"
-                alts = ["en-US", "yue-Hant-HK"]
+                primary, alts, mode = "zh-TW", ["en-US", "yue-Hant-HK"], "zh-TW"
             else:
-                primary = "yue-Hant-HK"
-                alts = ["en-US", "zh-TW"]
-                mode = "auto"
+                primary, alts, mode = "yue-Hant-HK", ["en-US", "zh-TW"], "auto"
 
         logger.info("GCP WS connected. Mode=%s | Primary=%s | Alts=%s", mode, primary, alts)
 
@@ -274,7 +239,7 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
         bytes_src = _QueueBytesSource()
         out_q: "asyncio.Queue[Optional[speech.StreamingRecognizeResponse]]" = asyncio.Queue()
         stop_event = asyncio.Event()
-        loop = asyncio.get_running_loop()  # capture main loop for thread-safe handoff
+        loop = asyncio.get_running_loop()
 
         async def _reader_from_client():
             try:
@@ -294,12 +259,7 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
                 stop_event.set()
 
         def _gcp_streaming_call():
-            """
-            Runs in a worker thread. Sends audio requests and pushes responses back
-            to the main asyncio loop via out_q using run_coroutine_threadsafe.
-            """
             try:
-                # Pass config explicitly; generator yields only audio_content requests.
                 responses = speech_client.streaming_recognize(
                     config=stream_cfg,
                     requests=bytes_src.audio_requests(),
