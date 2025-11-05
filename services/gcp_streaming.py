@@ -171,6 +171,9 @@ def _normalize_to_aws_like_payload(result: speech.StreamingRecognitionResult, pr
     items = _words_to_items(words)
 
     detected_lang = getattr(alt, "language_code", None) or None
+    logger.info("GCP v2 detected language_code: %s, transcript: %s", detected_lang, transcript_text[:100])
+    if not detected_lang:
+    detected_lang = "en-US" if not _has_cjk(transcript_text) else "cmn-Hant-TW"  # Default to Mandarin for CJK, as it was more reliable
     confidence = getattr(alt, "confidence", None)
     
     # Enhanced logging for debugging
