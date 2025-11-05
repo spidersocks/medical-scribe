@@ -7,7 +7,7 @@ import queue
 import os
 from typing import Dict, List, Optional, Iterable, Tuple
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from google.cloud import speech_v2 as speech
@@ -157,6 +157,10 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
         speech_client = speech.SpeechClient(client_options=client_options)
         
         recognition_config = _build_v2_recognition_config(language_codes, model="latest_long")
+        
+        # Use a full recognizer resource name, but point to 'global' to satisfy some client routing issues.
+        # The regional endpoint will correctly route the request based on the client options.
+        recognizer_name = f"projects/{project}/locations/global/recognizers/_"
         streaming_config = speech.StreamingRecognitionConfig(config=recognition_config)
 
         bytes_src = _QueueBytesSource()
@@ -164,7 +168,8 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
         loop = asyncio.get_running_loop()
 
         def _request_generator():
-            yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+            # The first request must contain the recognizer and config.
+            yield speech.StreamingRecognizeRequest(recognizer=recognizer_name, streaming_config=streaming_config)
             yield from bytes_src.audio_requests()
 
         def _gcp_streaming_call():
@@ -191,13 +196,11 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
         try:
             while ws.client_state == WebSocketState.CONNECTED:
                 data = await ws.receive_bytes()
-                if not data: break
                 await bytes_src.put(data)
         except WebSocketDisconnect:
             logger.info("Browser disconnected.")
         finally:
             await bytes_src.put(None)
-            await asyncio.sleep(0.1) # allow time for final messages
             writer_task.cancel()
             try: await writer_task
             except asyncio.CancelledError: pass
