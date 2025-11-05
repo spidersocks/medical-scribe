@@ -17,6 +17,11 @@ try:
 except Exception:
     register_gcp_streaming_routes = None  # type: ignore
 
+try:
+    from services.gcp_streaming_v2 import register_gcp_streaming_v2_routes
+except Exception:
+    register_gcp_streaming_v2_routes = None  # type: ignore
+
 import aiohttp
 import boto3
 import uvicorn
@@ -1093,9 +1098,18 @@ def create_app() -> FastAPI:
             logger.warning("Failed to register GCP streaming route: %s", exc)
     else:
         logger.info("GCP streaming module not available; /client-transcribe-gcp not registered.")
-
+    
+    if register_gcp_streaming_v2_routes:
+        try:
+            gcp_project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")
+            gcp_location = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+            register_gcp_streaming_v2_routes(app, gcp_project_id=gcp_project_id, gcp_location=gcp_location)
+            logger.info("Registered /client-transcribe-gcp-v2 endpoint (GCP Speech v2).")
+        except Exception as exc:
+            logger.warning("Failed to register GCP (v2) streaming route: %s", exc)
+    else:
+        logger.info("GCP v2 streaming module not available; /client-transcribe-gcp-v2 not registered.")
     return app
-
 
 app = create_app()
 
