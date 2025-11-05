@@ -11,7 +11,8 @@ from starlette.websockets import WebSocketState
 
 from google.cloud import speech_v2 as speech
 from google.cloud import translate_v3 as translate
-from google.api_core.client_options import ClientOptions  # NEW
+from google.api_core.client_options import ClientOptions
+import google.auth  # NEW
 
 from services import nlp  # reuse AWS Comprehend Medical for English NER
 
@@ -294,12 +295,19 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
         # Normalize for v2 support (maps zh-TW -> cmn-Hant-TW; switches global -> asia-east1 when CJK present)
         language_codes, location = _normalize_v2_langs_and_location(requested_codes, requested_location)
 
-        logger.info("GCP v2 WS connected. language_codes=%s | location=%s", language_codes, location)
+        # Resolve project id robustly
+        project = _resolve_gcp_project_id(gcp_project_id)
+        if not project:
+            logger.error("GCP v2: Could not resolve project id. Set GOOGLE_CLOUD_PROJECT or credentials project.")
+            # Close gracefully and return
+            await ws.close(code=1011, reason="GCP project id missing")
+            return
 
-        # Build a region-matching Speech client for v2
-        # v2 requires the API endpoint region to match the recognizer location
+        logger.info("GCP v2 WS connected. language_codes=%s | location=%s | project=%s", language_codes, location, project)
+
+        # Build region-matching Speech client for v2
         if location.lower() == "global":
-            speech_client = speech.SpeechClient()  # default global endpoint
+            speech_client = speech.SpeechClient()
         else:
             api_endpoint = f"{location}-speech.googleapis.com"
             logger.info("GCP v2 using regional endpoint: %s", api_endpoint)
@@ -307,9 +315,12 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
 
         streaming_config = _build_v2_streaming_config(language_codes)
 
-        # Recognizer shortcut resource ("_") allows inline configs without creating a named recognizer
-        project = gcp_project_id or "-"
-        recognizer = f"projects/{project}/locations/{location}/recognizers/_"
+        # Recognizer resource name(s) to try (ephemeral inline config)
+        # Some stacks accept '_' while others accept '-' as the ephemeral placeholder
+        recognizer_candidates = [
+            f"projects/{project}/locations/{location}/recognizers/_",
+            f"projects/{project}/locations/{location}/recognizers/-",
+        ]
 
         bytes_src = _QueueBytesSource()
         out_q: "asyncio.Queue[Optional[speech.StreamingRecognizeResponse]]" = asyncio.Queue()
@@ -333,28 +344,47 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
             finally:
                 stop_event.set()
 
-        def _request_generator():
+        def _request_generator(recognizer_name: str):
             # First request includes recognizer and streaming_config
             yield speech.StreamingRecognizeRequest(
                 streaming_config=streaming_config,
-                recognizer=recognizer,
+                recognizer=recognizer_name,
             )
             # Followed by audio chunks
             for req in bytes_src.audio_requests():
                 yield req
 
         def _gcp_streaming_call():
-            try:
-                responses = speech_client.streaming_recognize(requests=_request_generator())
-                for resp in responses:
-                    asyncio.run_coroutine_threadsafe(out_q.put(resp), loop)
-            except Exception as exc:
-                logger.error("GCP v2 streaming_recognize error: %s", exc)
-            finally:
+            """
+            Try each recognizer candidate until one works. This avoids regional 404s caused by '_' vs '-'.
+            """
+            last_exc: Optional[Exception] = None
+            for idx, recog_name in enumerate(recognizer_candidates):
                 try:
-                    asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
-                except Exception:
-                    pass
+                    logger.info("GCP v2 attempting streaming with recognizer: %s", recog_name)
+                    responses = speech_client.streaming_recognize(requests=_request_generator(recog_name))
+                    for resp in responses:
+                        asyncio.run_coroutine_threadsafe(out_q.put(resp), loop)
+                    # If we exited the loop normally, break
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    # If recognizer name was the issue (404/UNIMPLEMENTED), try next candidate
+                    msg = str(exc) or ""
+                    if "404" in msg or "NOT_FOUND" in msg or "unimplemented" in msg.lower():
+                        logger.warning("GCP v2 streaming failed with %s; trying next recognizer form if available.", msg.strip())
+                        continue
+                    # Other errors (permissions, invalid arg): stop early
+                    logger.error("GCP v2 streaming_recognize error (non-recoverable): %s", exc)
+                    break
+            # After trying all candidates, if still failing, signal writer to exit
+            if last_exc is not None:
+                logger.error("GCP v2 streaming_recognize failed after all recognizer forms. Last error: %s", last_exc)
+            try:
+                asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
+            except Exception:
+                pass
 
         async def _writer_to_client():
             try:
@@ -363,7 +393,7 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
                     if resp is None:
                         break
                     for result in resp.results or []:
-                        payload = _normalize_to_aws_like_payload(result, gcp_project_id)
+                        payload = _normalize_to_aws_like_payload(result, project)
                         if ws.client_state == WebSocketState.CONNECTED:
                             await ws.send_text(json.dumps(payload))
             except Exception as exc:
