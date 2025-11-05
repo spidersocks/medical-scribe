@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 import queue
+import os  # NEW
 from typing import Dict, List, Optional, Iterable, Tuple
 
 from fastapi import FastAPI, WebSocket
@@ -98,6 +99,25 @@ def _translate_to_english(
         logger.warning("Translate v3 failed (src=%s). Falling back to original. Error: %s", source_lang or "auto", exc)
     return text
 
+# NEW: resolve project id robustly
+def _resolve_gcp_project_id(explicit: Optional[str]) -> Optional[str]:
+    """
+    Resolve the GCP project id in this order:
+      1) explicit arg
+      2) GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT env var
+      3) google.auth.default() inferred project
+    """
+    if explicit:
+        return explicit
+    env_proj = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")
+    if env_proj:
+        return env_proj
+    try:
+        _, proj = google.auth.default()
+        return proj
+    except Exception:
+        return None
+
 class _QueueBytesSource:
     def __init__(self):
         self._q: "queue.Queue[Optional[bytes]]" = queue.Queue()
@@ -147,7 +167,7 @@ def _build_v2_streaming_config(language_codes: List[str]) -> speech.StreamingRec
     cfg = speech.RecognitionConfig(
         auto_decoding_config=speech.AutoDetectDecodingConfig(),
         language_codes=language_codes,   # true multi-language list (no primary)
-        model="latest_long",             # try latest_long first; change to latest_short if you want less latency
+        model="latest_long",             # try latest_short for lower latency if preferred
         features=features,
     )
     return speech.StreamingRecognitionConfig(config=cfg)
@@ -269,12 +289,10 @@ def _normalize_v2_langs_and_location(codes: List[str], requested_location: str) 
             normalized.append("yue-Hant-HK")
             has_cjk = True
         elif cl.startswith("zh"):
-            # If user passed generic zh, prefer Traditional path in HK deployment
             normalized.append("cmn-Hant-TW")
             has_cjk = True
         else:
             normalized.append(c)
-    # Location normalization
     loc = (requested_location or "global").strip() or "global"
     if has_cjk and loc.lower() == "global":
         loc = "asia-east1"
@@ -285,27 +303,21 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
     async def client_transcribe_gcp_v2(ws: WebSocket):
         await ws.accept()
 
-        # Parse language list or default to all three
         raw = (ws.query_params.get("languages") or "").strip()
         requested_codes = _normalize_lang_list_param(raw) if raw else ["en-US", "yue-Hant-HK", "zh-TW"]
 
-        # Determine location (env default, overridable via query)
         requested_location = (ws.query_params.get("location") or gcp_location or "global").strip()
 
-        # Normalize for v2 support (maps zh-TW -> cmn-Hant-TW; switches global -> asia-east1 when CJK present)
         language_codes, location = _normalize_v2_langs_and_location(requested_codes, requested_location)
 
-        # Resolve project id robustly
         project = _resolve_gcp_project_id(gcp_project_id)
         if not project:
             logger.error("GCP v2: Could not resolve project id. Set GOOGLE_CLOUD_PROJECT or credentials project.")
-            # Close gracefully and return
             await ws.close(code=1011, reason="GCP project id missing")
             return
 
         logger.info("GCP v2 WS connected. language_codes=%s | location=%s | project=%s", language_codes, location, project)
 
-        # Build region-matching Speech client for v2
         if location.lower() == "global":
             speech_client = speech.SpeechClient()
         else:
@@ -315,8 +327,6 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
 
         streaming_config = _build_v2_streaming_config(language_codes)
 
-        # Recognizer resource name(s) to try (ephemeral inline config)
-        # Some stacks accept '_' while others accept '-' as the ephemeral placeholder
         recognizer_candidates = [
             f"projects/{project}/locations/{location}/recognizers/_",
             f"projects/{project}/locations/{location}/recognizers/-",
@@ -345,40 +355,31 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
                 stop_event.set()
 
         def _request_generator(recognizer_name: str):
-            # First request includes recognizer and streaming_config
             yield speech.StreamingRecognizeRequest(
                 streaming_config=streaming_config,
                 recognizer=recognizer_name,
             )
-            # Followed by audio chunks
             for req in bytes_src.audio_requests():
                 yield req
 
         def _gcp_streaming_call():
-            """
-            Try each recognizer candidate until one works. This avoids regional 404s caused by '_' vs '-'.
-            """
             last_exc: Optional[Exception] = None
-            for idx, recog_name in enumerate(recognizer_candidates):
+            for recog_name in recognizer_candidates:
                 try:
                     logger.info("GCP v2 attempting streaming with recognizer: %s", recog_name)
                     responses = speech_client.streaming_recognize(requests=_request_generator(recog_name))
                     for resp in responses:
                         asyncio.run_coroutine_threadsafe(out_q.put(resp), loop)
-                    # If we exited the loop normally, break
                     last_exc = None
                     break
                 except Exception as exc:
                     last_exc = exc
-                    # If recognizer name was the issue (404/UNIMPLEMENTED), try next candidate
                     msg = str(exc) or ""
                     if "404" in msg or "NOT_FOUND" in msg or "unimplemented" in msg.lower():
                         logger.warning("GCP v2 streaming failed with %s; trying next recognizer form if available.", msg.strip())
                         continue
-                    # Other errors (permissions, invalid arg): stop early
                     logger.error("GCP v2 streaming_recognize error (non-recoverable): %s", exc)
                     break
-            # After trying all candidates, if still failing, signal writer to exit
             if last_exc is not None:
                 logger.error("GCP v2 streaming_recognize failed after all recognizer forms. Last error: %s", last_exc)
             try:
