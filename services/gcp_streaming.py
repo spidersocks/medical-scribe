@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
-from google.cloud import speech_v2 as speech  # Changed to v2
+from google.cloud import speech_v2 as speech  # v2 API
 from google.cloud import translate_v3 as translate
 
 from services import nlp  # reuse Comprehend Medical via AWS for English NER
@@ -104,15 +104,15 @@ class _QueueBytesSource:
             yield speech.StreamingRecognizeRequest(audio_content=item)
 
 def _build_gcp_streaming_config(languages: List[str]) -> speech.StreamingRecognitionConfig:
-    # Updated for v2: Use auto_decoding_config and language_codes
+    # v2 config structure
     config = speech.RecognitionConfig(
-        auto_decoding_config=speech.AutoDecodingConfig(),
+        auto_detect_decoding_config=speech.AutoDetectDecodingConfig(),  # Fixed: AutoDetectDecodingConfig
         language_codes=languages,
         model="latest_long",
         features=speech.RecognitionFeatures(
             enable_automatic_punctuation=True,
             enable_word_time_offsets=True,
-            enable_speaker_diarization=True,
+            # Removed enable_speaker_diarization (not supported in v2 RecognitionFeatures)
             diarization_config=speech.SpeakerDiarizationConfig(
                 min_speaker_count=2,
                 max_speaker_count=2,
