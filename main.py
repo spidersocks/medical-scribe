@@ -122,6 +122,29 @@ class CommandPayload(BaseModel):
     command: str
 
 
+# ---- PHI Masking Utility ----
+def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patient") -> str:
+    """
+    Replace all text spans labeled as PROTECTED_HEALTH_INFORMATION in Comprehend Medical entities
+    with a generic mask token. This is done by offset in reverse order to preserve indices.
+    """
+    # Only consider PHI entities with valid offsets
+    spans = [
+        (e["BeginOffset"], e["EndOffset"])
+        for e in entities
+        if e.get("Category") == "PROTECTED_HEALTH_INFORMATION"
+        and e.get("BeginOffset") is not None
+        and e.get("EndOffset") is not None
+        and e["BeginOffset"] < e["EndOffset"]
+    ]
+    # Sort in reverse order so replacement doesn't affect later offsets
+    spans.sort(reverse=True)
+    masked = text
+    for start, end in spans:
+        masked = masked[:start] + mask_token + masked[end:]
+    return masked
+
+
 # ---- Event stream utilities (AWS Transcribe proxy) ----
 def _encode_event_stream(headers: Dict[str, str], payload: bytes) -> bytes:
     headers_payload = b""
@@ -738,6 +761,9 @@ def register_routes(app: FastAPI) -> None:
             logger.info("Comprehend Medical returned %d entities.", len(entities))
             ents_compact = _filter_and_compact_entities_for_llm(entities)
 
+            # Mask PHI entities in the transcript before sending to the LLM
+            english_transcript_masked = _mask_phi_entities(english_transcript, entities)
+
             # Determine base system prompt for the requested note type
             try:
                 prompt_module = get_prompt_generator(payload.note_type)
@@ -780,9 +806,10 @@ def register_routes(app: FastAPI) -> None:
             encounter_type = getattr(payload, "encounter_type", None)
 
             # Generate note using composed system prompt and pass patient/encounter metadata
+            # Use the PHI-masked transcript for the LLM
             final_note = generate_note_from_system_prompt(
                 final_system_prompt,
-                english_transcript,
+                english_transcript_masked,
                 ents_compact,
                 patient_info=patient_info_dict,
                 encounter_time=encounter_time,
@@ -968,6 +995,18 @@ def build_presigned_url(selected_language: str = "en-US") -> str:
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
     return f"{endpoint}?{canonical_querystring}&X-Amz-Signature={signature}"
+
+
+def _sign(key, msg):
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _get_signature_key(key, date_stamp, region_name, service_name):
+    k_date = _sign(("AWS4" + key).encode("utf-8"), date_stamp)
+    k_region = _sign(k_date, region_name)
+    k_service = _sign(k_region, service_name)
+    k_signing = _sign(k_service, "aws4_request")
+    return k_signing
 
 
 # ---- small normalization helpers used after LLM output ----
