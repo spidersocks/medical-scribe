@@ -4,7 +4,7 @@ import logging
 import re
 import uuid
 import queue
-from typing import Dict, List, Optional, Iterable
+from typing import Dict, List, Optional, Iterable, Tuple
 
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
@@ -120,22 +120,33 @@ class _QueueBytesSource:
             yield speech.StreamingRecognizeRequest(audio=item)
 
 def _build_v2_streaming_config(language_codes: List[str]) -> speech.StreamingRecognitionConfig:
-    features = speech.RecognitionFeatures(
+    """
+    Build a v2 StreamingRecognitionConfig.
+    Diarization is configured via RecognitionFeatures.diarization_config in v2-capable clients.
+    """
+    base_features_kwargs = dict(
         enable_automatic_punctuation=True,
         enable_word_time_offsets=True,
-        # Do NOT put diarization here in v2
     )
-    # v2: diarization is enabled by providing this config (no boolean flag)
-    diar = speech.SpeakerDiarizationConfig(
-        min_speaker_count=2,
-        max_speaker_count=2,
-    )
+
+    # Try enabling diarization via features; fallback without diarization if unsupported by installed SDK
+    try:
+        features = speech.RecognitionFeatures(
+            **base_features_kwargs,
+            diarization_config=speech.SpeakerDiarizationConfig(
+                min_speaker_count=2,
+                max_speaker_count=2,
+            ),
+        )
+    except Exception as exc:
+        logger.warning("GCP v2: diarization_config unsupported in this client/version; continuing without diarization. %s", exc)
+        features = speech.RecognitionFeatures(**base_features_kwargs)
+
     cfg = speech.RecognitionConfig(
         auto_decoding_config=speech.AutoDetectDecodingConfig(),
-        language_codes=language_codes,      # true multi-language list (no "primary")
-        model="latest_long",                # try "latest_short" if you want snappier turn-taking
+        language_codes=language_codes,   # true multi-language list (no primary)
+        model="latest_long",             # try latest_long first; change to latest_short if you want less latency
         features=features,
-        diarization_config=diar,
     )
     return speech.StreamingRecognitionConfig(config=cfg)
 
@@ -211,12 +222,10 @@ def _normalize_to_aws_like_payload(
 
 def _normalize_lang_list_param(raw: str) -> List[str]:
     """
-    Accept 'en-US,yue-Hant-HK,zh-TW?language_code=auto' and normalize to ['en-US','yue-Hant-HK','zh-TW'].
-    Also accepts '&' or extra whitespace; dedups and preserves only known codes.
+    Accept 'en-US,yue-Hant-HK,zh-TW?foo=bar' and normalize to ['en-US','yue-Hant-HK','zh-TW'].
     """
     if not raw:
         return []
-    # strip anything after a second ? (caused by frontend appending ?language_code=auto)
     raw = raw.split("?", 1)[0]
     parts = re.split(r"[,\s&]+", raw.strip())
     out = []
@@ -224,13 +233,9 @@ def _normalize_lang_list_param(raw: str) -> List[str]:
         p = p.strip()
         if not p:
             continue
-        # basic allowlist for your deployment
-        if p in ("en-US", "yue-Hant-HK", "zh-TW"):
-            out.append(p)
-        elif p == "zh-HK":
+        if p == "zh-HK":
             out.append("yue-Hant-HK")
         else:
-            # keep unknowns as-is to avoid being overly strict
             out.append(p)
     # de-duplicate preserving order
     seen = set()
@@ -241,6 +246,38 @@ def _normalize_lang_list_param(raw: str) -> List[str]:
             dedup.append(c)
     return dedup
 
+def _normalize_v2_langs_and_location(codes: List[str], requested_location: str) -> Tuple[List[str], str]:
+    """
+    v2 compatibility normalizations:
+    - Map zh-TW -> cmn-Hant-TW for better v2 coverage.
+    - Keep yue-Hant-HK as-is for Cantonese.
+    - If any Chinese (yue/zh/cmn) is requested and location=='global', use asia-east1 (widest zh/yue coverage).
+    """
+    normalized: List[str] = []
+    has_cjk = False
+    for c in codes:
+        cl = c.lower()
+        if cl in ("zh-tw", "cmn-hant-tw"):
+            normalized.append("cmn-Hant-TW")
+            has_cjk = True
+        elif cl == "zh-hk":
+            normalized.append("yue-Hant-HK")
+            has_cjk = True
+        elif cl.startswith("yue"):
+            normalized.append("yue-Hant-HK")
+            has_cjk = True
+        elif cl.startswith("zh"):
+            # If user passed generic zh, prefer Traditional path in HK deployment
+            normalized.append("cmn-Hant-TW")
+            has_cjk = True
+        else:
+            normalized.append(c)
+    # Location normalization
+    loc = (requested_location or "global").strip() or "global"
+    if has_cjk and loc.lower() == "global":
+        loc = "asia-east1"
+    return normalized, loc
+
 def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[str] = None, gcp_location: str = "global") -> None:
     @app.websocket("/client-transcribe-gcp-v2")
     async def client_transcribe_gcp_v2(ws: WebSocket):
@@ -248,16 +285,21 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
 
         # Parse language list or default to all three
         raw = (ws.query_params.get("languages") or "").strip()
-        language_codes = _normalize_lang_list_param(raw) if raw else ["en-US", "yue-Hant-HK", "zh-TW"]
+        requested_codes = _normalize_lang_list_param(raw) if raw else ["en-US", "yue-Hant-HK", "zh-TW"]
 
-        logger.info("GCP v2 WS connected. language_codes=%s", language_codes)
+        # Determine location (env default, overridable via query)
+        requested_location = (ws.query_params.get("location") or gcp_location or "global").strip()
+
+        # Normalize for v2 support
+        language_codes, location = _normalize_v2_langs_and_location(requested_codes, requested_location)
+
+        logger.info("GCP v2 WS connected. language_codes=%s | location=%s", language_codes, location)
 
         speech_client = speech.SpeechClient()
         streaming_config = _build_v2_streaming_config(language_codes)
 
         # Recognizer shortcut resource ("_") allows inline configs without creating a named recognizer
         project = gcp_project_id or "-"
-        location = (ws.query_params.get("location") or gcp_location or "global").strip()
         recognizer = f"projects/{project}/locations/{location}/recognizers/_"
 
         bytes_src = _QueueBytesSource()
