@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
-from google.cloud import speech_v1p1beta1 as speech
+from google.cloud import speech_v2 as speech  # Changed to v2
 from google.cloud import translate_v3 as translate
 
 from services import nlp  # reuse Comprehend Medical via AWS for English NER
@@ -103,48 +103,27 @@ class _QueueBytesSource:
                 break
             yield speech.StreamingRecognizeRequest(audio_content=item)
 
-def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> speech.StreamingRecognitionConfig:
-    diarization = speech.SpeakerDiarizationConfig(
-        enable_speaker_diarization=True,
-        min_speaker_count=2,
-        max_speaker_count=2,
+def _build_gcp_streaming_config(languages: List[str]) -> speech.StreamingRecognitionConfig:
+    # Updated for v2: Use auto_decoding_config and language_codes
+    config = speech.RecognitionConfig(
+        auto_decoding_config=speech.AutoDecodingConfig(),
+        language_codes=languages,
+        model="latest_long",
+        features=speech.RecognitionFeatures(
+            enable_automatic_punctuation=True,
+            enable_word_time_offsets=True,
+            enable_speaker_diarization=True,
+            diarization_config=speech.SpeakerDiarizationConfig(
+                min_speaker_count=2,
+                max_speaker_count=2,
+            ),
+        ),
     )
-
-    # Expanded speech contexts with more Cantonese/Mandarin medical and common phrases
-    speech_contexts = [
-        speech.SpeechContext(
-            phrases=[
-                # English medical terms (keep for balance)
-                "metformin", "lisinopril", "prednisone", "glucose", "blood pressure",
-                "shortness of breath", "chest pain", "budesonide", "spirometer",
-                # Cantonese (Traditional) medical/common terms
-                "糖尿", "抽血", "血壓", "呼吸唔順", "胸口痛", "走十五分鐘", "覆診", "醫生", "病人", "藥",
-                "血糖", "心臟", "肺", "胃", "頭痛", "肚痛", "行路", "食飯", "飲水",
-                # Mandarin (Traditional) equivalents
-                "糖尿病", "抽血", "血壓", "呼吸不順", "胸口痛", "走十五分鐘", "覆診", "醫生", "病人", "藥",
-                "血糖", "心臟", "肺", "胃", "頭痛", "肚子痛", "走路", "吃飯", "喝水",
-            ],
-            boost=15.0,  # Increased boost for stronger bias
-        )
-    ]
-
-    recog = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code=primary_lang,
-        alternative_language_codes=alt_langs,
-        enable_automatic_punctuation=True,
-        enable_word_time_offsets=True,
-        diarization_config=diarization,
-        speech_contexts=speech_contexts,
-        # Add adaptive language modeling for better multi-lang detection
-        use_enhanced=True,  # Enable enhanced models if available
-    )
-
     return speech.StreamingRecognitionConfig(
-        config=recog,
-        interim_results=True,
-        single_utterance=False,
+        config=config,
+        streaming_features=speech.StreamingRecognitionFeatures(
+            interim_results=True,
+        ),
     )
 
 def _words_to_items(words: List[speech.WordInfo]) -> List[Dict]:
@@ -171,14 +150,11 @@ def _normalize_to_aws_like_payload(result: speech.StreamingRecognitionResult, pr
     items = _words_to_items(words)
 
     detected_lang = getattr(alt, "language_code", None) or None
-    logger.info("GCP v2 detected language_code: %s, transcript: %s", detected_lang, transcript_text[:100])
-    if not detected_lang:
-    detected_lang = "en-US" if not _has_cjk(transcript_text) else "cmn-Hant-TW"  # Default to Mandarin for CJK, as it was more reliable
     confidence = getattr(alt, "confidence", None)
     
     # Enhanced logging for debugging
     logger.info(
-        "GCP result: is_final=%s, transcript='%s', detected_lang='%s', confidence=%.3f, alternatives_count=%d",
+        "GCP v2 result: is_final=%s, transcript='%s', detected_lang='%s', confidence=%.3f, alternatives_count=%d",
         is_final, transcript_text[:100], detected_lang, confidence or 0.0, len(result.alternatives) if result.alternatives else 0
     )
     
@@ -190,7 +166,7 @@ def _normalize_to_aws_like_payload(result: speech.StreamingRecognitionResult, pr
             logger.info("  Alt %d: lang='%s', conf=%.3f, text='%s'", i, alt_lang, alt_conf or 0.0, alt.transcript[:50])
 
     if not detected_lang:
-        detected_lang = "en-US" if not _has_cjk(transcript_text) else "yue-Hant-HK"
+        detected_lang = "en-US" if not _has_cjk(transcript_text) else "cmn-Hant-TW"  # Default to Mandarin for CJK
 
     payload = {
         "Transcript": {
@@ -234,31 +210,14 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
     async def client_transcribe_gcp(ws: WebSocket):
         await ws.accept()
 
-        primary_ui = ws.query_params.get("language_code", "auto") or "auto"
-        bias = (ws.query_params.get("bias") or "").lower()
+        # Updated to parse languages parameter for v2
+        languages = ws.query_params.get("languages", "en-US").split(",")
+        languages = [lang.strip() for lang in languages if lang.strip()]  # Clean up
 
-        # Improved bias logic: if auto, strongly bias toward Cantonese/Mandarin
-        if bias == "en":
-            primary, alts, mode = "en-US", ["yue-Hant-HK", "cmn-Hant-TW"], "bias=en"
-        elif bias == "yue":
-            primary, alts, mode = "yue-Hant-HK", ["cmn-Hant-TW", "en-US"], "bias=yue"
-        elif bias == "zh":
-            primary, alts, mode = "cmn-Hant-TW", ["yue-Hant-HK", "en-US"], "bias=zh"
-        else:
-            # For auto or unspecified, prioritize Cantonese, then Mandarin, then English
-            if primary_ui == "en-US":
-                primary, alts, mode = "en-US", ["yue-Hant-HK", "cmn-Hant-TW"], "en-US"
-            elif primary_ui == "zh-HK":
-                primary, alts, mode = "yue-Hant-HK", ["cmn-Hant-TW", "en-US"], "zh-HK"
-            elif primary_ui == "zh-TW":
-                primary, alts, mode = "cmn-Hant-TW", ["yue-Hant-HK", "en-US"], "zh-TW"
-            else:
-                primary, alts, mode = "yue-Hant-HK", ["cmn-Hant-TW", "en-US"], "auto"  # Strong Chinese bias for auto
-
-        logger.info("GCP WS connected. Mode=%s | Primary=%s | Alts=%s", mode, primary, alts)
+        logger.info("GCP WS connected. Languages=%s", languages)
 
         speech_client = speech.SpeechClient()
-        stream_cfg = _build_gcp_streaming_config(primary, alts)
+        stream_cfg = _build_gcp_streaming_config(languages)
 
         bytes_src = _QueueBytesSource()
         out_q: "asyncio.Queue[Optional[speech.StreamingRecognizeResponse]]" = asyncio.Queue()
