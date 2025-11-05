@@ -130,13 +130,20 @@ def _build_gcp_streaming_config(languages: List[str]) -> speech.StreamingRecogni
     # We use the first language from the client's list, or a default.
     single_language_list = [languages[0]] if languages else ["en-US"]
 
+    # NEW: Configure speaker diarization
+    diarization_config = speech.SpeakerDiarizationConfig(
+        min_speaker_count=1,
+        max_speaker_count=6,
+    )
+    
     config = speech.RecognitionConfig(
         explicit_decoding_config=explicit_config,
-        language_codes=single_language_list, # THIS IS THE FIX
+        language_codes=single_language_list,
         model="chirp",
         features=speech.RecognitionFeatures(
             enable_automatic_punctuation=True,
-            enable_word_time_offsets=False,
+            enable_word_time_offsets=False, # Keep false if not used, to reduce data
+            diarization_config=diarization_config, # ADDED: Enable diarization
         ),
     )
     
@@ -144,6 +151,7 @@ def _build_gcp_streaming_config(languages: List[str]) -> speech.StreamingRecogni
         config=config,
         streaming_features=speech.StreamingRecognitionFeatures(
             interim_results=True,
+            enable_voice_activity_events=True, # Recommended for diarization
         ),
     )
 
@@ -152,13 +160,15 @@ def _words_to_items(words: List[speech.WordInfo]) -> List[Dict]:
     for w in words or []:
         start = _dur_to_seconds(getattr(w, "start_offset", None))
         end = _dur_to_seconds(getattr(w, "end_offset", None))
+        speaker_tag = getattr(w, "speaker_tag", 0) # speaker_tag is int (e.g. 1, 2)
+        speaker_label = _spk_label_from_tag(speaker_tag) # convert to spk_0, spk_1
         items.append(
             {
                 "StartTime": round(start, 3),
                 "EndTime": round(end, 3),
                 "Type": "pronunciation",
                 "Content": w.word,
-                "Speaker": getattr(w, "speaker_label", None),
+                "Speaker": speaker_label, # CHANGED: Use the converted label
             }
         )
     return items
@@ -235,7 +245,7 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
             await ws.close(code=1011, reason="Server configuration error.")
             return
 
-        languages = ws.query_params.get("languages", "en-US,es-US").split(",")
+        languages = ws.query_params.get("languages", "en-US,yue-Hant-HK,cmn-Hant-TW").split(",")
         languages = [lang.strip() for lang in languages if lang.strip()]
 
         logger.info("GCP WS connected. Project=%s, Languages from client=%s", gcp_project_id, languages)
