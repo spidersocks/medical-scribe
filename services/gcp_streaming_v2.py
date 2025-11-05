@@ -11,6 +11,7 @@ from starlette.websockets import WebSocketState
 
 from google.cloud import speech_v2 as speech
 from google.cloud import translate_v3 as translate
+from google.api_core.client_options import ClientOptions  # NEW
 
 from services import nlp  # reuse AWS Comprehend Medical for English NER
 
@@ -290,12 +291,20 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
         # Determine location (env default, overridable via query)
         requested_location = (ws.query_params.get("location") or gcp_location or "global").strip()
 
-        # Normalize for v2 support
+        # Normalize for v2 support (maps zh-TW -> cmn-Hant-TW; switches global -> asia-east1 when CJK present)
         language_codes, location = _normalize_v2_langs_and_location(requested_codes, requested_location)
 
         logger.info("GCP v2 WS connected. language_codes=%s | location=%s", language_codes, location)
 
-        speech_client = speech.SpeechClient()
+        # Build a region-matching Speech client for v2
+        # v2 requires the API endpoint region to match the recognizer location
+        if location.lower() == "global":
+            speech_client = speech.SpeechClient()  # default global endpoint
+        else:
+            api_endpoint = f"{location}-speech.googleapis.com"
+            logger.info("GCP v2 using regional endpoint: %s", api_endpoint)
+            speech_client = speech.SpeechClient(client_options=ClientOptions(api_endpoint=api_endpoint))
+
         streaming_config = _build_v2_streaming_config(language_codes)
 
         # Recognizer shortcut resource ("_") allows inline configs without creating a named recognizer
