@@ -12,11 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zlib import crc32
 
-try:
-    from services.gcp_streaming import register_gcp_streaming_routes
-except Exception:
-    register_gcp_streaming_routes = None  # type: ignore
-
 import aiohttp
 import boto3
 import uvicorn
@@ -125,29 +120,6 @@ class FinalNotePayload(BaseModel):
 class CommandPayload(BaseModel):
     note_content: Dict[str, Any]
     command: str
-
-
-# ---- PHI Masking Utility ----
-def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patient") -> str:
-    """
-    Replace all text spans labeled as PROTECTED_HEALTH_INFORMATION in Comprehend Medical entities
-    with a generic mask token. This is done by offset in reverse order to preserve indices.
-    """
-    # Only consider PHI entities with valid offsets
-    spans = [
-        (e["BeginOffset"], e["EndOffset"])
-        for e in entities
-        if e.get("Category") == "PROTECTED_HEALTH_INFORMATION"
-        and e.get("BeginOffset") is not None
-        and e.get("EndOffset") is not None
-        and e["BeginOffset"] < e["EndOffset"]
-    ]
-    # Sort in reverse order so replacement doesn't affect later offsets
-    spans.sort(reverse=True)
-    masked = text
-    for start, end in spans:
-        masked = masked[:start] + mask_token + masked[end:]
-    return masked
 
 
 # ---- Event stream utilities (AWS Transcribe proxy) ----
@@ -584,16 +556,6 @@ def _prepare_template_instructions(template_item: dict) -> str:
 
     return "\n".join(parts)
 
-def _sign(key: bytes, msg: str) -> bytes:
-    import hmac, hashlib
-    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-def _get_signature_key(secret_key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
-    kDate = _sign(("AWS4" + secret_key).encode("utf-8"), date_stamp)
-    kRegion = _sign(kDate, region_name)
-    kService = _sign(kRegion, service_name)
-    kSigning = _sign(kService, "aws4_request")
-    return kSigning
 
 # -------- Routes registration (includes WebSocket proxy) --------
 def register_routes(app: FastAPI) -> None:
@@ -676,20 +638,14 @@ def register_routes(app: FastAPI) -> None:
                                 try:
                                     results = payload.get("Transcript", {}).get("Results", [])
                                     if not results:
-                                        # mark even partials so the UI can log engine
-                                        payload["_engine"] = "aws"
-                                        if ws.client_state == WebSocketState.CONNECTED:
-                                            await ws.send_text(json.dumps(payload))
                                         continue
 
                                     result = results[0]
                                     if result.get("IsPartial", True):
-                                        payload["_engine"] = "aws"
                                         if ws.client_state == WebSocketState.CONNECTED:
                                             await ws.send_text(json.dumps(payload))
                                         continue
 
-                                    # Final segment processing...
                                     original_text = result.get("Alternatives", [{}])[0].get("Transcript", "")
                                     if not original_text:
                                         continue
@@ -711,7 +667,6 @@ def register_routes(app: FastAPI) -> None:
 
                                     entities = get_comprehend_client().detect_entities_v2(Text=english_text)
                                     payload["ComprehendEntities"] = entities.get("Entities", [])
-                                    payload["_engine"] = "aws"  # <-- stamp here for finals too
                                     logger.info(
                                         "Processed final segment (%s). Entities=%d",
                                         detected_language,
@@ -783,9 +738,6 @@ def register_routes(app: FastAPI) -> None:
             logger.info("Comprehend Medical returned %d entities.", len(entities))
             ents_compact = _filter_and_compact_entities_for_llm(entities)
 
-            # Mask PHI entities in the transcript before sending to the LLM
-            english_transcript_masked = _mask_phi_entities(english_transcript, entities)
-
             # Determine base system prompt for the requested note type
             try:
                 prompt_module = get_prompt_generator(payload.note_type)
@@ -828,10 +780,9 @@ def register_routes(app: FastAPI) -> None:
             encounter_type = getattr(payload, "encounter_type", None)
 
             # Generate note using composed system prompt and pass patient/encounter metadata
-            # Use the PHI-masked transcript for the LLM
             final_note = generate_note_from_system_prompt(
                 final_system_prompt,
-                english_transcript_masked,
+                english_transcript,
                 ents_compact,
                 patient_info=patient_info_dict,
                 encounter_time=encounter_time,
@@ -1078,22 +1029,12 @@ def create_app() -> FastAPI:
         max_age=86400,
     )
 
+    # Avoid automatic trailing-slash redirect responses which can break CORS preflight flows
     app.router.redirect_slashes = False
 
+    # include API router and register additional bespoke routes
     app.include_router(api_router)
     register_routes(app)
-
-    # NEW: register Google STT streaming endpoint
-    if register_gcp_streaming_routes:
-        try:
-            gcp_project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")
-            register_gcp_streaming_routes(app, gcp_project_id=gcp_project_id)
-            logger.info("Registered /client-transcribe-gcp endpoint (GCP Speech).")
-        except Exception as exc:
-            logger.warning("Failed to register GCP streaming route: %s", exc)
-    else:
-        logger.info("GCP streaming module not available; /client-transcribe-gcp not registered.")
-
     return app
 
 
