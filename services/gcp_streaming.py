@@ -110,17 +110,21 @@ def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> spee
         max_speaker_count=2,
     )
 
-    # Light phrase hints to stabilize English medical terms and common Cantonese tokens.
+    # Expanded speech contexts with more Cantonese/Mandarin medical and common phrases
     speech_contexts = [
         speech.SpeechContext(
             phrases=[
-                # English medical/common terms
+                # English medical terms (keep for balance)
                 "metformin", "lisinopril", "prednisone", "glucose", "blood pressure",
                 "shortness of breath", "chest pain", "budesonide", "spirometer",
-                # Cantonese common words in HK clinical speech (Traditional)
-                "醫生", "病人", "糖尿", "抽血", "藥", "呼吸", "痛", "行十五分鐘", "覆診",
+                # Cantonese (Traditional) medical/common terms
+                "糖尿", "抽血", "血壓", "呼吸唔順", "胸口痛", "走十五分鐘", "覆診", "醫生", "病人", "藥",
+                "血糖", "心臟", "肺", "胃", "頭痛", "肚痛", "行路", "食飯", "飲水",
+                # Mandarin (Traditional) equivalents
+                "糖尿病", "抽血", "血壓", "呼吸不順", "胸口痛", "走十五分鐘", "覆診", "醫生", "病人", "藥",
+                "血糖", "心臟", "肺", "胃", "頭痛", "肚子痛", "走路", "吃飯", "喝水",
             ],
-            boost=10.0,
+            boost=15.0,  # Increased boost for stronger bias
         )
     ]
 
@@ -133,6 +137,8 @@ def _build_gcp_streaming_config(primary_lang: str, alt_langs: List[str]) -> spee
         enable_word_time_offsets=True,
         diarization_config=diarization,
         speech_contexts=speech_contexts,
+        # Add adaptive language modeling for better multi-lang detection
+        use_enhanced=True,  # Enable enhanced models if available
     )
 
     return speech.StreamingRecognitionConfig(
@@ -165,7 +171,21 @@ def _normalize_to_aws_like_payload(result: speech.StreamingRecognitionResult, pr
     items = _words_to_items(words)
 
     detected_lang = getattr(alt, "language_code", None) or None
-    logger.info("GCP detected language_code: %s, transcript: %s", detected_lang, transcript_text[:100])  # Add this line
+    confidence = getattr(alt, "confidence", None)
+    
+    # Enhanced logging for debugging
+    logger.info(
+        "GCP result: is_final=%s, transcript='%s', detected_lang='%s', confidence=%.3f, alternatives_count=%d",
+        is_final, transcript_text[:100], detected_lang, confidence or 0.0, len(result.alternatives) if result.alternatives else 0
+    )
+    
+    # Log all alternatives if multiple languages are present
+    if result.alternatives and len(result.alternatives) > 1:
+        for i, alt in enumerate(result.alternatives):
+            alt_lang = getattr(alt, "language_code", None)
+            alt_conf = getattr(alt, "confidence", None)
+            logger.info("  Alt %d: lang='%s', conf=%.3f, text='%s'", i, alt_lang, alt_conf or 0.0, alt.transcript[:50])
+
     if not detected_lang:
         detected_lang = "en-US" if not _has_cjk(transcript_text) else "yue-Hant-HK"
 
@@ -212,25 +232,25 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
         await ws.accept()
 
         primary_ui = ws.query_params.get("language_code", "auto") or "auto"
-        bias = (ws.query_params.get("bias") or "").lower()  # NEW: optional bias=en|yue|zh
+        bias = (ws.query_params.get("bias") or "").lower()
 
-        # Choose primary/alts
+        # Improved bias logic: if auto, strongly bias toward Cantonese/Mandarin
         if bias == "en":
-            primary, alts, mode = "en-US", ["yue-Hant-HK", "zh-TW"], "bias=en"
+            primary, alts, mode = "en-US", ["yue-Hant-HK", "cmn-Hant-TW"], "bias=en"
         elif bias == "yue":
-            primary, alts, mode = "yue-Hant-HK", ["en-US", "zh-TW"], "bias=yue"
+            primary, alts, mode = "yue-Hant-HK", ["cmn-Hant-TW", "en-US"], "bias=yue"
         elif bias == "zh":
-            primary, alts, mode = "zh-TW", ["en-US", "yue-Hant-HK"], "bias=zh"
+            primary, alts, mode = "cmn-Hant-TW", ["yue-Hant-HK", "en-US"], "bias=zh"
         else:
-            # language_code override if provided; otherwise default to Cantonese primary for auto
+            # For auto or unspecified, prioritize Cantonese, then Mandarin, then English
             if primary_ui == "en-US":
-                primary, alts, mode = "en-US", ["yue-Hant-HK", "zh-TW"], "en-US"
+                primary, alts, mode = "en-US", ["yue-Hant-HK", "cmn-Hant-TW"], "en-US"
             elif primary_ui == "zh-HK":
-                primary, alts, mode = "yue-Hant-HK", ["en-US", "zh-TW"], "zh-HK"
+                primary, alts, mode = "yue-Hant-HK", ["cmn-Hant-TW", "en-US"], "zh-HK"
             elif primary_ui == "zh-TW":
-                primary, alts, mode = "zh-TW", ["en-US", "yue-Hant-HK"], "zh-TW"
+                primary, alts, mode = "cmn-Hant-TW", ["yue-Hant-HK", "en-US"], "zh-TW"
             else:
-                primary, alts, mode = "yue-Hant-HK", ["en-US", "zh-TW"], "auto"
+                primary, alts, mode = "yue-Hant-HK", ["cmn-Hant-TW", "en-US"], "auto"  # Strong Chinese bias for auto
 
         logger.info("GCP WS connected. Mode=%s | Primary=%s | Alts=%s", mode, primary, alts)
 
