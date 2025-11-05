@@ -123,19 +123,19 @@ def _build_v2_streaming_config(language_codes: List[str]) -> speech.StreamingRec
     features = speech.RecognitionFeatures(
         enable_automatic_punctuation=True,
         enable_word_time_offsets=True,
-        # DO NOT set diarization flag here; use SpeakerDiarizationConfig below
+        # Do NOT put diarization here in v2
     )
+    # v2: diarization is enabled by providing this config (no boolean flag)
     diar = speech.SpeakerDiarizationConfig(
-        enable_speaker_diarization=True,
         min_speaker_count=2,
         max_speaker_count=2,
     )
     cfg = speech.RecognitionConfig(
         auto_decoding_config=speech.AutoDetectDecodingConfig(),
-        language_codes=language_codes,      # true multi-language list
-        model="latest_long",                # consider "latest_short" for lower latency
+        language_codes=language_codes,      # true multi-language list (no "primary")
+        model="latest_long",                # try "latest_short" if you want snappier turn-taking
         features=features,
-        diarization_config=diar,            # diarization is configured here
+        diarization_config=diar,
     )
     return speech.StreamingRecognitionConfig(config=cfg)
 
