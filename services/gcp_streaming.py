@@ -4,17 +4,22 @@ import logging
 import re
 import uuid
 import queue
+from itertools import chain
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket
-from starlette.websockets import WebSocketState
+from starlette.websockets import WebSocket, WebSocketState, WebSocketDisconnect
 
 from google.cloud import speech_v2 as speech  # v2 API
 from google.cloud import translate_v3 as translate
+from google.api_core.client_options import ClientOptions
+from google.api_core.exceptions import InvalidArgument
 
 from services import nlp  # reuse Comprehend Medical via AWS for English NER
 
 logger = logging.getLogger("stethoscribe-gcp")
+
+GCP_REGION = "us-central1" 
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -64,6 +69,7 @@ def _map_asr_lang_to_translate_source(asr_code: Optional[str]) -> str:
 def _translate_to_english(text: str, project_id: Optional[str] = None, location: str = "global", source_lang: Optional[str] = None) -> str:
     if not text.strip():
         return text
+    # Note: Translation API can still use a 'global' location, separate from Speech API
     parent = f"projects/{project_id or '-'}/locations/{location}"
     req = {
         "parent": parent,
@@ -96,29 +102,44 @@ class _QueueBytesSource:
     def close(self):
         self._closed = True
 
-    def audio_requests(self):
+    def audio_requests(self, recognizer_name: str):
         while True:
             item = self._q.get()
             if item is None:
                 break
-            yield speech.StreamingRecognizeRequest(audio_content=item)
+            # Each audio chunk request must include the recognizer resource name.
+            yield speech.StreamingRecognizeRequest(
+                recognizer=recognizer_name,
+                audio=item
+            )
 
 def _build_gcp_streaming_config(languages: List[str]) -> speech.StreamingRecognitionConfig:
-    # v2 config structure
+    explicit_config = speech.ExplicitDecodingConfig(
+        encoding=speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        audio_channel_count=1,
+    )
+    
+    # --- CHANGE: Provide exactly ONE language code ---
+    # The API has conflicting requirements for the 'chirp' model:
+    # 1. The `language_codes` field cannot be empty.
+    # 2. The multi-language detection feature (using >1 language) is not supported.
+    # The solution is to provide a list with a single language code. This satisfies
+    # the schema validation without enabling the unsupported feature. The 'chirp'
+    # model will still perform its own universal language detection.
+    # We use the first language from the client's list, or a default.
+    single_language_list = [languages[0]] if languages else ["en-US"]
+
     config = speech.RecognitionConfig(
-        auto_detect_decoding_config=speech.AutoDetectDecodingConfig(),  # Fixed: AutoDetectDecodingConfig
-        language_codes=languages,
-        model="latest_long",
+        explicit_decoding_config=explicit_config,
+        language_codes=single_language_list, # THIS IS THE FIX
+        model="chirp",
         features=speech.RecognitionFeatures(
             enable_automatic_punctuation=True,
-            enable_word_time_offsets=True,
-            # Removed enable_speaker_diarization (not supported in v2 RecognitionFeatures)
-            diarization_config=speech.SpeakerDiarizationConfig(
-                min_speaker_count=2,
-                max_speaker_count=2,
-            ),
+            enable_word_time_offsets=False,
         ),
     )
+    
     return speech.StreamingRecognitionConfig(
         config=config,
         streaming_features=speech.StreamingRecognitionFeatures(
@@ -129,44 +150,43 @@ def _build_gcp_streaming_config(languages: List[str]) -> speech.StreamingRecogni
 def _words_to_items(words: List[speech.WordInfo]) -> List[Dict]:
     items = []
     for w in words or []:
-        start = _dur_to_seconds(getattr(w, "start_time", None))
-        end = _dur_to_seconds(getattr(w, "end_time", None))
+        start = _dur_to_seconds(getattr(w, "start_offset", None))
+        end = _dur_to_seconds(getattr(w, "end_offset", None))
         items.append(
             {
                 "StartTime": round(start, 3),
                 "EndTime": round(end, 3),
                 "Type": "pronunciation",
                 "Content": w.word,
-                "Speaker": _spk_label_from_tag(getattr(w, "speaker_tag", None)),
+                "Speaker": getattr(w, "speaker_label", None),
             }
         )
     return items
 
 def _normalize_to_aws_like_payload(result: speech.StreamingRecognitionResult, project_id_for_translate: Optional[str]) -> Dict:
-    is_final = bool(result.is_final)
+    is_final = bool(getattr(result, 'is_final', False))
     alt = result.alternatives[0] if result.alternatives else None
     transcript_text = alt.transcript if alt else ""
     words = list(getattr(alt, "words", []) or [])
     items = _words_to_items(words)
 
-    detected_lang = getattr(alt, "language_code", None) or None
+    detected_lang = getattr(result, "language_code", None) or None
     confidence = getattr(alt, "confidence", None)
     
-    # Enhanced logging for debugging
-    logger.info(
-        "GCP v2 result: is_final=%s, transcript='%s', detected_lang='%s', confidence=%.3f, alternatives_count=%d",
-        is_final, transcript_text[:100], detected_lang, confidence or 0.0, len(result.alternatives) if result.alternatives else 0
-    )
+    if is_final:
+        logger.info(
+            "GCP v2 result: is_final=%s, transcript='%s', detected_lang='%s', confidence=%.3f, alternatives_count=%d",
+            is_final, transcript_text[:100], detected_lang, confidence or 0.0, len(result.alternatives) if result.alternatives else 0
+        )
     
-    # Log all alternatives if multiple languages are present
-    if result.alternatives and len(result.alternatives) > 1:
-        for i, alt in enumerate(result.alternatives):
-            alt_lang = getattr(alt, "language_code", None)
-            alt_conf = getattr(alt, "confidence", None)
-            logger.info("  Alt %d: lang='%s', conf=%.3f, text='%s'", i, alt_lang, alt_conf or 0.0, alt.transcript[:50])
+    if result.alternatives and len(result.alternatives) > 1 and is_final:
+        for i, alt_item in enumerate(result.alternatives):
+            alt_lang = getattr(alt_item, "language_code", None)
+            alt_conf = getattr(alt_item, "confidence", None)
+            logger.info("  Alt %d: lang='%s', conf=%.3f, text='%s'", i, alt_lang, alt_conf or 0.0, alt_item.transcript[:50])
 
     if not detected_lang:
-        detected_lang = "en-US" if not _has_cjk(transcript_text) else "cmn-Hant-TW"  # Default to Mandarin for CJK
+        detected_lang = "en-US" if not _has_cjk(transcript_text) else "cmn-Hant-TW"
 
     payload = {
         "Transcript": {
@@ -210,13 +230,21 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
     async def client_transcribe_gcp(ws: WebSocket):
         await ws.accept()
 
-        # Updated to parse languages parameter for v2
-        languages = ws.query_params.get("languages", "en-US").split(",")
-        languages = [lang.strip() for lang in languages if lang.strip()]  # Clean up
+        if not gcp_project_id:
+            logger.error("GCP Project ID is not configured on the server. Closing connection.")
+            await ws.close(code=1011, reason="Server configuration error.")
+            return
 
-        logger.info("GCP WS connected. Languages=%s", languages)
+        languages = ws.query_params.get("languages", "en-US,es-US").split(",")
+        languages = [lang.strip() for lang in languages if lang.strip()]
 
-        speech_client = speech.SpeechClient()
+        logger.info("GCP WS connected. Project=%s, Languages from client=%s", gcp_project_id, languages)
+
+        client_options = ClientOptions(
+            api_endpoint=f"{GCP_REGION}-speech.googleapis.com"
+        )
+        speech_client = speech.SpeechClient(client_options=client_options)
+        
         stream_cfg = _build_gcp_streaming_config(languages)
 
         bytes_src = _QueueBytesSource()
@@ -232,8 +260,17 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
                         await bytes_src.put(None)
                         break
                     await bytes_src.put(data)
+            except WebSocketDisconnect as exc:
+                if exc.code == 1000:
+                    logger.info("Browser closed the connection gracefully (Code: 1000).")
+                else:
+                    logger.warning("Browser disconnected with code: %s", exc.code)
+                try:
+                    await bytes_src.put(None)
+                except Exception:
+                    pass
             except Exception as exc:
-                logger.info("Browser disconnected or receive error: %s", exc)
+                logger.error("An unexpected error occurred while receiving from client: %s", exc, exc_info=True)
                 try:
                     await bytes_src.put(None)
                 except Exception:
@@ -241,16 +278,29 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
             finally:
                 stop_event.set()
 
-        def _gcp_streaming_call():
+        def _gcp_streaming_call(project_id: str):
+            recognizer_name = f"projects/{project_id}/locations/{GCP_REGION}/recognizers/_"
+
+            config_request = speech.StreamingRecognizeRequest(
+                recognizer=recognizer_name,
+                streaming_config=stream_cfg
+            )
+
+            all_requests = chain([config_request], bytes_src.audio_requests(recognizer_name))
+            
             try:
-                responses = speech_client.streaming_recognize(
-                    config=stream_cfg,
-                    requests=bytes_src.audio_requests(),
-                )
+                responses = speech_client.streaming_recognize(requests=all_requests)
                 for resp in responses:
                     asyncio.run_coroutine_threadsafe(out_q.put(resp), loop)
+            except InvalidArgument as exc:
+                logger.error(
+                    "GCP streaming_recognize error due to InvalidArgument: %s. "
+                    "This may be due to an unsupported feature combination with the 'chirp' model.",
+                    exc,
+                    exc_info=True
+                )
             except Exception as exc:
-                logger.error("GCP streaming_recognize error: %s", exc)
+                logger.error("GCP streaming_recognize error: %s", exc, exc_info=True)
             finally:
                 try:
                     asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
@@ -264,6 +314,8 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
                     if resp is None:
                         break
                     for result in resp.results or []:
+                        if not result.alternatives or not result.alternatives[0].transcript:
+                            continue
                         payload = _normalize_to_aws_like_payload(result, gcp_project_id)
                         if ws.client_state == WebSocketState.CONNECTED:
                             await ws.send_text(json.dumps(payload))
@@ -272,7 +324,8 @@ def register_gcp_streaming_routes(app: FastAPI, *, gcp_project_id: Optional[str]
 
         reader_task = asyncio.create_task(_reader_from_client())
         writer_task = asyncio.create_task(_writer_to_client())
-        _ = asyncio.get_running_loop().run_in_executor(None, _gcp_streaming_call)
+        
+        _ = asyncio.get_running_loop().run_in_executor(None, _gcp_streaming_call, gcp_project_id)
 
         try:
             await asyncio.wait(
