@@ -4,7 +4,8 @@ import logging
 import re
 import uuid
 import queue
-import os  # NEW
+import os
+import hashlib
 from typing import Dict, List, Optional, Iterable, Tuple
 
 from fastapi import FastAPI, WebSocket
@@ -13,7 +14,8 @@ from starlette.websockets import WebSocketState
 from google.cloud import speech_v2 as speech
 from google.cloud import translate_v3 as translate
 from google.api_core.client_options import ClientOptions
-import google.auth  # NEW
+from google.api_core import exceptions as gax
+import google.auth
 
 from services import nlp  # reuse AWS Comprehend Medical for English NER
 
@@ -99,14 +101,7 @@ def _translate_to_english(
         logger.warning("Translate v3 failed (src=%s). Falling back to original. Error: %s", source_lang or "auto", exc)
     return text
 
-# NEW: resolve project id robustly
 def _resolve_gcp_project_id(explicit: Optional[str]) -> Optional[str]:
-    """
-    Resolve the GCP project id in this order:
-      1) explicit arg
-      2) GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT env var
-      3) google.auth.default() inferred project
-    """
     if explicit:
         return explicit
     env_proj = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")
@@ -141,7 +136,7 @@ class _QueueBytesSource:
                 break
             yield speech.StreamingRecognizeRequest(audio=item)
 
-def _build_v2_streaming_config(language_codes: List[str]) -> speech.StreamingRecognitionConfig:
+def _build_v2_streaming_config(language_codes: List[str], model: str = "latest_long") -> speech.StreamingRecognitionConfig:
     """
     Build a v2 StreamingRecognitionConfig.
     Diarization is configured via RecognitionFeatures.diarization_config in v2-capable clients.
@@ -167,10 +162,79 @@ def _build_v2_streaming_config(language_codes: List[str]) -> speech.StreamingRec
     cfg = speech.RecognitionConfig(
         auto_decoding_config=speech.AutoDetectDecodingConfig(),
         language_codes=language_codes,   # true multi-language list (no primary)
-        model="latest_long",             # try latest_short for lower latency if preferred
+        model=model,                     # latest_long or latest_short
         features=features,
     )
     return speech.StreamingRecognitionConfig(config=cfg)
+
+def _build_v2_recognizer_config(language_codes: List[str], model: str = "latest_long") -> speech.RecognitionConfig:
+    # Mirror the streaming config for the default_recognition_config on the Recognizer
+    features = speech.RecognitionFeatures(
+        enable_automatic_punctuation=True,
+        enable_word_time_offsets=True,
+    )
+    try:
+        features.diarization_config = speech.SpeakerDiarizationConfig(
+            min_speaker_count=2, max_speaker_count=2
+        )
+    except Exception:
+        # older SDKs may not support diarization_config on features; skip silently
+        pass
+
+    return speech.RecognitionConfig(
+        auto_decoding_config=speech.AutoDetectDecodingConfig(),
+        language_codes=language_codes,
+        model=model,
+        features=features,
+    )
+
+def _safe_recognizer_id(language_codes: List[str], model: str) -> str:
+    # Deterministic short id: stetho-<hash>-<modelshort>, keep <= 63 chars
+    key = "|".join(sorted(language_codes)) + "|" + model
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    modelshort = model.replace("_", "").replace("-", "")
+    rid = f"stetho-{h}-{modelshort}"
+    return rid[:63]
+
+def _ensure_v2_recognizer(
+    client: speech.SpeechClient,
+    project: str,
+    location: str,
+    language_codes: List[str],
+    model: str = "latest_long",
+) -> str:
+    """
+    Create or reuse a regional Recognizer with the given languages/model.
+    Returns the full resource name.
+    """
+    parent = f"projects/{project}/locations/{location}"
+    recognizer_id = _safe_recognizer_id(language_codes, model)
+    name = f"{parent}/recognizers/{recognizer_id}"
+
+    try:
+        client.get_recognizer(request={"name": name})
+        logger.info("GCP v2 recognizer exists: %s", name)
+        return name
+    except gax.NotFound:
+        pass
+
+    cfg = _build_v2_recognizer_config(language_codes, model=model)
+    logger.info("GCP v2 creating recognizer: %s", name)
+    op = client.create_recognizer(
+        request={
+            "parent": parent,
+            "recognizer": speech.Recognizer(default_recognition_config=cfg),
+            "recognizer_id": recognizer_id,
+        }
+    )
+    # Wait for creation to complete (usually a few seconds)
+    try:
+        _ = op.result(timeout=60)
+    except Exception as exc:
+        logger.error("Failed to create recognizer %s: %s", name, exc)
+        raise
+    logger.info("GCP v2 recognizer ready: %s", name)
+    return name
 
 def _words_to_items(words) -> List[Dict]:
     items = []
@@ -303,13 +367,17 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
     async def client_transcribe_gcp_v2(ws: WebSocket):
         await ws.accept()
 
+        # Parse language list or default to all three
         raw = (ws.query_params.get("languages") or "").strip()
         requested_codes = _normalize_lang_list_param(raw) if raw else ["en-US", "yue-Hant-HK", "zh-TW"]
 
+        # Determine location (env default, overridable via query)
         requested_location = (ws.query_params.get("location") or gcp_location or "global").strip()
 
+        # Normalize for v2 support (maps zh-TW -> cmn-Hant-TW; switches global -> asia-east1 when CJK present)
         language_codes, location = _normalize_v2_langs_and_location(requested_codes, requested_location)
 
+        # Resolve project id robustly
         project = _resolve_gcp_project_id(gcp_project_id)
         if not project:
             logger.error("GCP v2: Could not resolve project id. Set GOOGLE_CLOUD_PROJECT or credentials project.")
@@ -318,6 +386,7 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
 
         logger.info("GCP v2 WS connected. language_codes=%s | location=%s | project=%s", language_codes, location, project)
 
+        # Build region-matching Speech client for v2
         if location.lower() == "global":
             speech_client = speech.SpeechClient()
         else:
@@ -325,12 +394,24 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
             logger.info("GCP v2 using regional endpoint: %s", api_endpoint)
             speech_client = speech.SpeechClient(client_options=ClientOptions(api_endpoint=api_endpoint))
 
-        streaming_config = _build_v2_streaming_config(language_codes)
+        # Model selection with graceful fallback (some regions/models restrict langs)
+        model = "latest_long"
+        streaming_config = _build_v2_streaming_config(language_codes, model=model)
 
-        recognizer_candidates = [
-            f"projects/{project}/locations/{location}/recognizers/_",
-            f"projects/{project}/locations/{location}/recognizers/-",
-        ]
+        # Ensure a real recognizer exists and use it
+        try:
+            recognizer_name = _ensure_v2_recognizer(speech_client, project, location, language_codes, model=model)
+        except Exception as exc:
+            # Try a faster model fallback before giving up
+            try:
+                logger.warning("Falling back to model=latest_short due to recognizer create error: %s", exc)
+                model = "latest_short"
+                streaming_config = _build_v2_streaming_config(language_codes, model=model)
+                recognizer_name = _ensure_v2_recognizer(speech_client, project, location, language_codes, model=model)
+            except Exception as exc2:
+                logger.error("Failed to prepare recognizer in %s: %s", location, exc2)
+                await ws.close(code=1011, reason="Failed to prepare recognizer")
+                return
 
         bytes_src = _QueueBytesSource()
         out_q: "asyncio.Queue[Optional[speech.StreamingRecognizeResponse]]" = asyncio.Queue()
@@ -354,38 +435,28 @@ def register_gcp_streaming_v2_routes(app: FastAPI, *, gcp_project_id: Optional[s
             finally:
                 stop_event.set()
 
-        def _request_generator(recognizer_name: str):
+        def _request_generator():
+            # First request includes recognizer and streaming_config
             yield speech.StreamingRecognizeRequest(
                 streaming_config=streaming_config,
                 recognizer=recognizer_name,
             )
+            # Followed by audio chunks
             for req in bytes_src.audio_requests():
                 yield req
 
         def _gcp_streaming_call():
-            last_exc: Optional[Exception] = None
-            for recog_name in recognizer_candidates:
-                try:
-                    logger.info("GCP v2 attempting streaming with recognizer: %s", recog_name)
-                    responses = speech_client.streaming_recognize(requests=_request_generator(recog_name))
-                    for resp in responses:
-                        asyncio.run_coroutine_threadsafe(out_q.put(resp), loop)
-                    last_exc = None
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    msg = str(exc) or ""
-                    if "404" in msg or "NOT_FOUND" in msg or "unimplemented" in msg.lower():
-                        logger.warning("GCP v2 streaming failed with %s; trying next recognizer form if available.", msg.strip())
-                        continue
-                    logger.error("GCP v2 streaming_recognize error (non-recoverable): %s", exc)
-                    break
-            if last_exc is not None:
-                logger.error("GCP v2 streaming_recognize failed after all recognizer forms. Last error: %s", last_exc)
             try:
-                asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
-            except Exception:
-                pass
+                responses = speech_client.streaming_recognize(requests=_request_generator())
+                for resp in responses:
+                    asyncio.run_coroutine_threadsafe(out_q.put(resp), loop)
+            except Exception as exc:
+                logger.error("GCP v2 streaming_recognize error: %s", exc)
+            finally:
+                try:
+                    asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
+                except Exception:
+                    pass
 
         async def _writer_to_client():
             try:
