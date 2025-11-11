@@ -55,6 +55,7 @@ class Settings(BaseModel):
     aws_session_token: Optional[str] = None
     allowed_origins: List[str] = []
     bedrock_model_id: str = "mistral.mistral-large-2402-v1:0"
+    dashscope_api_key: Optional[str] = None  
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,6 +68,7 @@ class Settings(BaseModel):
             aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
             allowed_origins=allowed_origins,
             bedrock_model_id=os.getenv("BEDROCK_MODEL_ID", "mistral.mistral-large-2402-v1:0"),
+            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"), 
         )
 
 
