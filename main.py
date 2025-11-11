@@ -26,6 +26,8 @@ from starlette.middleware.gzip import GZipMiddleware
 from prompts import PROMPT_REGISTRY, get_prompt_generator
 from config import settings  # <--- IMPORT FROM THE NEW FILE
 
+logger = logging.getLogger(__name__)
+
 # API router and services
 try:
     from api import api_router
