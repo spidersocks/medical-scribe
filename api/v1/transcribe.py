@@ -12,13 +12,45 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+import asyncio
+import json
+import logging
+from typing import List
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
+from dashscope.audio.asr import Recognition
+
+from config import settings  
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
 @router.websocket("/alibaba")
 async def transcribe_alibaba(ws: WebSocket):
     """Proxy to Alibaba Paraformer real-time transcription service."""
     await ws.accept()
 
+    # --- NEW: LOGIC TO HANDLE LANGUAGE CODE ---
     language_code = ws.query_params.get("language_code", "en-US")
     logger.info("Browser connected to Alibaba endpoint. Selected language=%s", language_code)
+
+    # Convert the frontend language code to the format Alibaba expects.
+    # The `language_hints` parameter is an array of language abbreviations.
+    language_hints: List[str] = ['en', 'yue', 'zh'] # Default: English, Cantonese, Mandarin
+    
+    if language_code == "en-US":
+        # Prioritize English if selected
+        language_hints = ['en', 'yue', 'zh']
+    elif language_code == "zh-HK":
+        # Prioritize Cantonese if selected
+        language_hints = ['yue', 'en', 'zh']
+    elif language_code == "zh-TW":
+        # Prioritize Mandarin if selected
+        language_hints = ['zh', 'en', 'yue']
+    
+    logger.info("Setting Alibaba language_hints to: %s", language_hints)
 
     if not settings.dashscope_api_key:
         logger.error("DASHSCOPE_API_KEY is not set.")
@@ -114,8 +146,8 @@ async def transcribe_alibaba(ws: WebSocket):
             format='pcm',
             sample_rate=16000,
             callback=callback,
-            diarization_enabled=True, # Enable speaker diarization
-            language_hints=['zh', 'en', 'yue'], # For Mandarin, English, Cantonese
+            diarization_enabled=True,
+            language_hints=language_hints,E
         )
 
         # Start the recognition process (this opens the WebSocket to Alibaba)
