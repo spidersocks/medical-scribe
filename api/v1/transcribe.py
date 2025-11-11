@@ -52,20 +52,60 @@ async def transcribe_alibaba(ws: WebSocket):
                 try:
                     data = json.loads(message)
                     logger.debug("Received from Alibaba: %s", data)
+
+                    header = data.get("header", {})
+                    payload = data.get("payload", {})
                     
-                    # TODO: Transform the Alibaba response (`data`) into the same
-                    # JSON structure that the existing AWS endpoint sends.
-                    # This is a critical step to ensure frontend compatibility.
-                    #
-                    # For now, we will just forward the raw message for debugging.
-                    # You will need to implement the transformation logic here based on
-                    # the actual structure of the Paraformer WebSocket response.
+                    if not header or not payload or not payload.get("result"):
+                        return
+
+                    # 1. Determine if the result is partial or final
+                    is_partial = header.get("name") == "TranscriptionResultChanged"
                     
+                    # 2. Extract the text and speaker
+                    transcript_text = payload.get("result")
+                    # Use speaker_id for final results, otherwise it will be null
+                    speaker_id = payload.get("speaker_id")
+
+                    # 3. Build the AWS-compatible structure
+                    aws_compatible_payload = {
+                        "Transcript": {
+                            "Results": [
+                                {
+                                    # Use the sentence_id from Alibaba for a stable ID
+                                    "ResultId": f"alibaba-seg-{payload.get('sentence_id', 0)}",
+                                    "IsPartial": is_partial,
+                                    "Alternatives": [
+                                        {
+                                            "Transcript": transcript_text,
+                                            # Create a minimal Items array with the speaker info
+                                            # The frontend uses this to determine the speaker
+                                            "Items": [
+                                                {
+                                                    "Type": "pronunciation",
+                                                    "Speaker": speaker_id
+                                                }
+                                            ] if speaker_id else []
+                                        }
+                                    ],
+                                    # Paraformer sends language with each sentence on final results
+                                    "LanguageCode": payload.get("language")
+                                }
+                            ]
+                        },
+                        # For now, we are not doing Comprehend or Translation.
+                        # We can add these later.
+                        "DisplayText": transcript_text,
+                        "TranslatedText": None,
+                        "ComprehendEntities": []
+                    }
+
+                    # 4. Send the transformed payload to the client
                     if self.websocket.client_state == WebSocketState.CONNECTED:
-                        await self.websocket.send_text(json.dumps(data))
+                        await self.websocket.send_text(json.dumps(aws_compatible_payload))
 
                 except Exception as e:
-                    logger.error("Error processing message from Alibaba: %s", e)
+                    logger.error("Error processing or transforming message from Alibaba: %s", e)
 
         # Initialize the recognizer
         callback = WsCallback(ws)
