@@ -3,6 +3,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 class Settings(BaseModel):
+    # ... (rest of the class is the same) ...
     aws_region: str = "us-east-1"
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
@@ -13,8 +14,14 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls) -> "Settings":
+        # --- ADD THIS PRINT STATEMENT ---
+        print(f"[DEBUG] Raw ALLOWED_ORIGINS from os.getenv: '{os.getenv('ALLOWED_ORIGINS', '')}'")
         raw_origins = os.getenv("ALLOWED_ORIGINS", "")
         allowed_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+        
+        # --- AND ADD THIS PRINT STATEMENT ---
+        print(f"[DEBUG] Parsed allowed_origins list: {allowed_origins}")
+        
         return cls(
             aws_region=os.getenv("AWS_REGION", "us-east-1"),
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
