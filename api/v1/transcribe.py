@@ -6,7 +6,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from dashscope.audio.asr import Recognition
 
-from main import settings
+from config import settings  
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
