@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -13,137 +13,64 @@ from config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Attempt type import (not strictly required)
-try:
-    from dashscope.audio.asr.recognition import RecognitionResult  # type: ignore
-except Exception:  # pragma: no cover
-    RecognitionResult = None  # type: ignore
+# Environment flag for verbose event logging
+ALIBABA_DEBUG = os.getenv("ALIBABA_DEBUG", "0") == "1"
 
+PARTIAL_EVENT_NAMES = {"TranscriptionResultChanged"}
+FINAL_EVENT_NAMES = {"SentenceEnd"}
+IGNORED_EVENT_NAMES = {"SentenceBegin"}
+FAIL_EVENT_NAMES = {"TaskFailed", "RecognitionFailed"}
 
-def _normalize_sentence(obj: Any) -> Optional[Dict[str, Any]]:
+def _transform_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Accepts:
-      - RecognitionResult with .sentence
-      - dict with 'sentence'
-      - already a sentence-shaped dict
-    Returns normalized dict or None.
-    """
-    if obj is None:
-        return None
-
-    # RecognitionResult path
-    if RecognitionResult and isinstance(obj, RecognitionResult):
-        raw = getattr(obj, "sentence", None)
-        return _normalize_sentence(raw)
-
-    # dict path with nested 'sentence'
-    if isinstance(obj, dict):
-        if "sentence" in obj and isinstance(obj["sentence"], dict):
-            return _normalize_sentence(obj["sentence"])
-        # Flattened structure
-        keys = set(obj.keys())
-        if {"text", "begin_time", "end_time"}.intersection(keys):
-            # It may or may not have words / sentence_end
-            return {
-                "text": obj.get("text") or obj.get("result") or "",
-                "begin_time": obj.get("begin_time"),
-                "end_time": obj.get("end_time"),
-                "words": obj.get("words") or [],
-                "sentence_end": bool(obj.get("sentence_end") or obj.get("is_final") or obj.get("final")),
-                "speaker": obj.get("speaker"),
-                "language": obj.get("language"),
-            }
-        if "result" in obj or "sentence_end" in obj:
-            return {
-                "text": obj.get("result") or "",
-                "begin_time": obj.get("begin_time"),
-                "end_time": obj.get("end_time"),
-                "words": obj.get("words") or [],
-                "sentence_end": bool(obj.get("sentence_end")),
-                "speaker": obj.get("speaker"),
-                "language": obj.get("language"),
-            }
-        return None
-
-    # Generic object with .text, .words, etc.
-    try:
-        text = getattr(obj, "text", "") or getattr(obj, "result", "") or ""
-        begin_time = getattr(obj, "begin_time", None)
-        end_time = getattr(obj, "end_time", None)
-        words = getattr(obj, "words", None) or []
-        sentence_end = bool(getattr(obj, "sentence_end", False) or getattr(obj, "is_final", False))
-        speaker = getattr(obj, "speaker", None)
-        language = getattr(obj, "language", None)
-        # If no text, treat as unusable
-        if not text and not words:
-            return None
-        return {
-            "text": text,
-            "begin_time": begin_time,
-            "end_time": end_time,
-            "words": words,
-            "sentence_end": sentence_end,
-            "speaker": speaker,
-            "language": language,
+    Convert a DashScope event (header + payload) into AWS Transcribe-like JSON.
+    Returns None if the event is not a transcription result.
+    Expected shapes per docs:
+      {
+        "header": {"name": "...", ...},
+        "payload": {
+           "result": "text",
+           "sentence_id": 3,
+           "speaker_id": "spk_0",
+           "language": "en",
+           ...
         }
-    except Exception:
+      }
+    """
+    if not isinstance(event, dict):
         return None
 
+    header = event.get("header") or {}
+    payload = event.get("payload") or {}
+    if not payload:
+        return None
 
-def _words_to_items(words: List[Dict[str, Any]], speaker: Optional[str]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for w in words or []:
-        try:
-            w_text = w.get("text") or w.get("content") or w.get("word")
-            if not w_text:
-                continue
-            itm: Dict[str, Any] = {"Type": "pronunciation", "Content": w_text}
-            if speaker:
-                itm["Speaker"] = speaker
-            # Optional timings if present
-            bt = w.get("begin_time")
-            et = w.get("end_time")
-            if isinstance(bt, int):
-                itm["StartTimeMs"] = bt
-            if isinstance(et, int):
-                itm["EndTimeMs"] = et
-            out.append(itm)
-        except Exception:
-            continue
-    return out
+    text = payload.get("result")
+    if not isinstance(text, str) or not text.strip():
+        return None
 
+    name = header.get("name") or ""
+    is_partial = name in PARTIAL_EVENT_NAMES
+    is_final = name in FINAL_EVENT_NAMES
 
-def _to_aws_shape(sentence: Dict[str, Any], seq: int, is_partial_override: Optional[bool] = None) -> Dict[str, Any]:
-    """
-    Build AWS-like payload:
-      IsPartial: True for incremental (on_result_changed), False for final (on_sentence_end)
-      We invert sentence['sentence_end'] unless override is provided.
-    """
-    text = (sentence.get("text") or "").strip()
-    if not text:
-        return {}
+    # We treat partial vs final via override; for final segments IsPartial=False
+    if not (is_partial or is_final):
+        return None  # Not a usable transcript-bearing event
 
-    speaker = sentence.get("speaker")
-    if not speaker:
-        # Try find first word with speaker field
-        for w in sentence.get("words") or []:
-            sp = w.get("speaker")
-            if sp:
-                speaker = sp
-                break
+    sentence_id = payload.get("sentence_id", 0)
+    speaker_id = payload.get("speaker_id")  # can be None for interim
+    language = payload.get("language")
 
-    is_final = bool(sentence.get("sentence_end"))
-    is_partial = is_partial_override if is_partial_override is not None else (not is_final)
+    # Build Items array (minimal: one pronunciation item for speaker labeling)
+    items = []
+    if speaker_id:
+        items.append({"Type": "pronunciation", "Speaker": speaker_id})
 
-    items = _words_to_items(sentence.get("words") or [], speaker)
-    if speaker and not items:
-        items.append({"Type": "pronunciation", "Speaker": speaker})
-
-    return {
+    aws_payload = {
         "Transcript": {
             "Results": [
                 {
-                    "ResultId": f"alibaba-seg-{seq}",
+                    "ResultId": f"alibaba-seg-{sentence_id}",
                     "IsPartial": is_partial,
                     "Alternatives": [
                         {
@@ -151,7 +78,7 @@ def _to_aws_shape(sentence: Dict[str, Any], seq: int, is_partial_override: Optio
                             "Items": items,
                         }
                     ],
-                    "LanguageCode": sentence.get("language"),
+                    "LanguageCode": language,
                 }
             ]
         },
@@ -159,12 +86,50 @@ def _to_aws_shape(sentence: Dict[str, Any], seq: int, is_partial_override: Optio
         "TranslatedText": None,
         "ComprehendEntities": [],
     }
+    return aws_payload
+
+
+def _safe_to_dict(message: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize incoming message into a dict with header/payload if possible.
+    Accepts:
+      - JSON string
+      - bytes (JSON)
+      - dict already
+      - object with .header /.payload
+    """
+    if message is None:
+        return None
+    if isinstance(message, (bytes, bytearray)):
+        try:
+            message = message.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+    if isinstance(message, str):
+        try:
+            parsed = json.loads(message)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    if isinstance(message, dict):
+        return message
+    # Generic object path
+    try:
+        header = getattr(message, "header", None)
+        payload = getattr(message, "payload", None)
+        if isinstance(header, dict) and isinstance(payload, dict):
+            return {"header": header, "payload": payload}
+    except Exception:
+        return None
+    return None
 
 
 @router.websocket("/alibaba")
 async def transcribe_alibaba(ws: WebSocket):
     """
-    WebSocket proxy: Browser PCM (16kHz 16-bit) -> DashScope Paraformer -> AWS-shaped JSON.
+    WebSocket proxy: Browser sends 16 kHz 16-bit PCM frames.
+    We forward frames to DashScope Paraformer real-time model and translate
+    its callback events into AWS-like transcript JSON.
     """
     await ws.accept()
 
@@ -176,12 +141,10 @@ async def transcribe_alibaba(ws: WebSocket):
         await ws.close(code=1011, reason="Missing API key.")
         return
 
-    # Ensure env var for SDK
     os.environ.setdefault("DASHSCOPE_API_KEY", settings.dashscope_api_key)
 
     loop = asyncio.get_running_loop()
     outbound_queue: asyncio.Queue = asyncio.Queue()
-    result_counter = 0
     running = True
 
     class Callback:
@@ -202,44 +165,45 @@ async def transcribe_alibaba(ws: WebSocket):
                 {"_close": True, "_reason": "Service closed"},
             )
 
-        def on_result_changed(self, result: Any):
+        def on_event(self, message: Any):
             """
-            Partial / incremental update.
+            Core event dispatcher for dashscope 1.25.0 (recognition.py invokes this).
             """
-            nonlocal result_counter
             try:
-                sentence = _normalize_sentence(result)
-                if not sentence:
-                    logger.debug("[DashScope] on_result_changed: no usable sentence object")
+                evt = _safe_to_dict(message)
+                if not evt:
+                    if ALIBABA_DEBUG:
+                        logger.debug("[DashScope] Ignored non-parsable event: %r", type(message).__name__)
                     return
-                # Do not increment counter for partial updates unless text changed meaningfully
-                result_counter += 1
-                payload = _to_aws_shape(sentence, result_counter, is_partial_override=True)
-                if payload:
-                    loop.call_soon_threadsafe(outbound_queue.put_nowait, payload)
-            except Exception as e:
-                logger.error("[DashScope] on_result_changed error: %s", e)
 
-        def on_sentence_end(self, result: Any):
-            """
-            Finalized sentence.
-            """
-            nonlocal result_counter
-            try:
-                sentence = _normalize_sentence(result)
-                if not sentence:
-                    logger.debug("[DashScope] on_sentence_end: no usable sentence object")
+                name = (evt.get("header") or {}).get("name")
+                if ALIBABA_DEBUG:
+                    logger.debug("[DashScope] Event name=%s keys=%s", name, list((evt.get("payload") or {}).keys())[:10])
+
+                if name in IGNORE_EVENT_NAMES:
+                    if ALIBABA_DEBUG:
+                        logger.debug("[DashScope] Ignored event %s", name)
                     return
-                result_counter += 1
-                payload = _to_aws_shape(sentence, result_counter, is_partial_override=False)
-                if payload:
-                    loop.call_soon_threadsafe(outbound_queue.put_nowait, payload)
-            except Exception as e:
-                logger.error("[DashScope] on_sentence_end error: %s", e)
 
-        # Some SDK versions may also emit on_sentence_begin; safe to implement
-        def on_sentence_begin(self, result: Any):
-            logger.debug("[DashScope] on_sentence_begin received (ignored for UI).")
+                if name in FAIL_EVENT_NAMES:
+                    reason = (evt.get("payload") or {}).get("error_message") or name
+                    logger.error("[DashScope] Failure event: %s", reason)
+                    loop.call_soon_threadsafe(
+                        outbound_queue.put_nowait,
+                        {"_close": True, "_reason": f"Recognition failed: {reason}"},
+                    )
+                    return
+
+                transformed = _transform_event(evt)
+                if not transformed:
+                    return
+
+                loop.call_soon_threadsafe(outbound_queue.put_nowait, transformed)
+            except Exception as e:
+                logger.error("on_event processing error: %s", e)
+
+    # NOTE: small typo correction (IGNORE_EVENT_NAMES variable was used above)
+    IGNORE_EVENT_NAMES = IGNORED_EVENT_NAMES
 
     recognizer: Optional[Recognition] = None
 
@@ -249,7 +213,12 @@ async def transcribe_alibaba(ws: WebSocket):
                 msg = await outbound_queue.get()
                 if isinstance(msg, dict) and msg.get("_close"):
                     if ws.client_state == WebSocketState.CONNECTED:
-                        await ws.send_text(json.dumps({"info": msg.get("_reason", "closed")}))
+                        # Send an info message before closing so frontend can surface error
+                        try:
+                            info_msg = {"error": msg.get("_reason", "Service closed")}
+                            await ws.send_text(json.dumps(info_msg))
+                        except Exception:
+                            pass
                         await ws.close(code=1011, reason=msg.get("_reason", "Service closed"))
                     break
                 if ws.client_state != WebSocketState.CONNECTED:
@@ -259,14 +228,22 @@ async def transcribe_alibaba(ws: WebSocket):
             logger.error("forward_events error: %s", e)
 
     async def pump_audio():
+        """
+        Receive PCM frames from browser and forward to recognizer.
+        Each Float32Array is converted to 16-bit PCM in the frontend already.
+        """
+        frame_count = 0
         try:
             while running:
                 chunk = await ws.receive_bytes()
                 if not chunk:
                     logger.info("Received empty chunk; treating as end-of-stream trigger.")
                     break
+                frame_count += 1
                 if recognizer:
                     recognizer.send_audio_frame(chunk)
+                if ALIBABA_DEBUG and frame_count % 50 == 0:
+                    logger.debug("[DashScope] Sent %d audio frames", frame_count)
         except WebSocketDisconnect:
             logger.info("Client disconnected (WebSocket).")
         except Exception as e:
