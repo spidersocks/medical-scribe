@@ -4,7 +4,8 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
+from collections import Counter
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -22,6 +23,7 @@ router = APIRouter()
 DBG = os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1"
 DO_TRANSLATE = os.getenv("ENABLE_ALIBABA_TRANSLATION") == "1"
 DO_ENTITIES = os.getenv("ENABLE_ALIBABA_ENTITIES") == "1"
+SPEAKER_COUNT = int(os.getenv("ALIBABA_SPEAKER_COUNT", "2"))
 
 if DBG:
     logger.setLevel(logging.DEBUG)
@@ -46,11 +48,73 @@ def _map_lang_to_ui(language: Optional[str], text: str = "") -> str:
             return "zh-TW"
     # Heuristic based on character sets
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
-        # Try differentiate Cantonese vs Mandarin
         if any(ch in CANTONESE_HINT_CHARS for ch in text):
             return "zh-HK"
         return "zh-TW"
     return "en-US"
+
+
+# --- Speaker extraction helpers ----------------------------------------------------
+def _norm_spk(val: Optional[str]) -> Optional[str]:
+    """Normalize various speaker forms to 'spk_0', 'spk_1', ... where possible."""
+    if not val:
+        return None
+    s = str(val).strip()
+    if s.startswith("spk_"):
+        return s
+    # common variants: '0', '1', 'SPEAKER_0', 'speaker1'
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if digits:
+        return f"spk_{int(digits)}"
+    # last resort: lowercase token itself
+    return s.lower()
+
+
+def _extract_speaker_from_words(words: Any) -> Optional[str]:
+    """
+    words is expected to be a list of tokens; each token may carry 'speaker' or 'spk'.
+    Return the majority speaker label if present.
+    """
+    if not isinstance(words, list) or not words:
+        return None
+    speakers: List[str] = []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        sp = _norm_spk(w.get("speaker") or w.get("spk") or w.get("spk_id"))
+        if sp:
+            speakers.append(sp)
+    if not speakers:
+        return None
+    # Majority vote
+    counts = Counter(speakers)
+    (winner, _count) = counts.most_common(1)[0]
+    return winner
+
+
+def _extract_speaker_from_sentence(sentence_or_payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Try multiple fields commonly used by Paraformer for diarization output.
+    Priority: sentence-level, then word-level majority.
+    """
+    sp = (
+        sentence_or_payload.get("speaker")
+        or sentence_or_payload.get("speaker_id")
+        or sentence_or_payload.get("spk")
+        or sentence_or_payload.get("spk_id")
+    )
+    sp_norm = _norm_spk(sp)
+    if sp_norm:
+        return sp_norm
+
+    # Look for word-level tokens
+    words = (
+        sentence_or_payload.get("words")
+        or sentence_or_payload.get("word")
+        or sentence_or_payload.get("Tokens")
+        or sentence_or_payload.get("tokens")
+    )
+    return _extract_speaker_from_words(words)
 
 
 # --- AWS-shaped payload builder ----------------------------------------------------
@@ -66,12 +130,8 @@ def _aws_shape(
     entities: Optional[List[dict]],
     debug: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Build the AWS-like payload consumed by existing frontend logic.
-    """
     items = []
     if speaker:
-        # Provide a simple single "pronunciation" item to retain speaker label parity
         items.append({"Type": "pronunciation", "Speaker": speaker})
 
     result_obj = {
@@ -89,7 +149,6 @@ def _aws_shape(
         result_obj["StartTimeMs"] = start_ms
     if end_ms is not None:
         result_obj["EndTimeMs"] = end_ms
-    # Duplicate speaker at top level of result for simpler extraction (new)
     if speaker:
         result_obj["Speaker"] = speaker
 
@@ -109,7 +168,7 @@ class ParaformerCallback(RecognitionCallback):
     """
     Converts DashScope events into AWS-shaped JSON.
     Handles both RecognitionResult objects and raw JSON strings.
-    Accumulates timing info.
+    Accumulates timing info and extracts speaker labels.
     """
     def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
         self.loop = loop
@@ -136,40 +195,40 @@ class ParaformerCallback(RecognitionCallback):
         logger.info("[DashScope] Recognition completed")
         self._emit({"_complete": True})
 
-    # Utility to compute ms relative to session start
     def _rel_ms(self, monotonic_time: float) -> int:
         return int((monotonic_time - self.session_start) * 1000)
 
     def on_event(self, message: Any):
         try:
             raw_debug: Dict[str, Any] = {}
-            speaker = None
-            language = None
-            sentence_id = None
+            speaker: Optional[str] = None
+            language: Optional[str] = None
+            sentence_id: Optional[int] = None
             is_final = False
             text = ""
+            sentence_or_payload: Dict[str, Any] = {}
 
-            # Extract from RecognitionResult objects
             if isinstance(message, RecognitionResult):
                 sentence = message.get_sentence()
                 raw_debug["raw_sentence"] = sentence
                 if not isinstance(sentence, dict):
                     return
+                sentence_or_payload = sentence
                 text = sentence.get("text") or sentence.get("result") or ""
-                speaker = sentence.get("speaker") or sentence.get("speaker_id")
                 language = (
                     sentence.get("language")
                     or sentence.get("lang")
                     or sentence.get("language_code")
                 )
                 sentence_id = sentence.get("sentence_id")
-
                 try:
                     is_final = message.is_sentence_end(sentence)
                 except Exception:
                     is_final = bool(sentence.get("is_sentence_end") or sentence.get("sentence_end"))
 
-            # Extract from raw JSON strings
+                # Try sentence-level first; if missing, check words
+                speaker = _extract_speaker_from_sentence(sentence)
+
             elif isinstance(message, str):
                 try:
                     parsed = json.loads(message)
@@ -177,7 +236,9 @@ class ParaformerCallback(RecognitionCallback):
                     return
                 raw_debug["raw_json"] = parsed
                 header = parsed.get("header", {})
-                payload = parsed.get("payload", {})
+                payload = parsed.get("payload", {}) or {}
+                sentence_or_payload = payload
+
                 name = header.get("name")
                 if name == "SentenceEnd":
                     is_final = True
@@ -187,7 +248,6 @@ class ParaformerCallback(RecognitionCallback):
                     return
 
                 text = payload.get("result") or payload.get("text") or ""
-                speaker = payload.get("speaker_id") or payload.get("speaker")
                 language = (
                     payload.get("language")
                     or payload.get("lang")
@@ -195,24 +255,24 @@ class ParaformerCallback(RecognitionCallback):
                 )
                 sentence_id = payload.get("sentence_id")
 
+                # Try to extract speaker from payload (words[] often carry 'spk')
+                speaker = _extract_speaker_from_sentence(payload)
+
             else:
-                return  # unknown type
+                return
 
             if not text:
                 return
 
-            # Timing handling
             now_mono = time.monotonic()
             if self.sentence_start_monotonic is None:
-                self.sentence_start_monotonic = now_mono  # first partial of sentence
+                self.sentence_start_monotonic = now_mono
 
             start_ms: Optional[int] = self._rel_ms(self.sentence_start_monotonic)
             end_ms: Optional[int] = None
 
             if is_final:
                 end_ms = self._rel_ms(now_mono)
-
-                # Unique id for every final
                 unique = uuid.uuid4().hex[:8]
                 if sentence_id is not None:
                     result_id = f"alibaba-seg-{sentence_id}-{unique}"
@@ -220,10 +280,8 @@ class ParaformerCallback(RecognitionCallback):
                     result_id = f"alibaba-seg-{self.final_counter}-{unique}"
                 self.final_counter += 1
                 self.current_partial_id = None
-                # Reset sentence timing for next one
                 self.sentence_start_monotonic = None
             else:
-                # Stable temp id
                 if self.current_partial_id is None:
                     base = sentence_id if sentence_id is not None else self.final_counter
                     self.current_partial_id = f"alibaba-temp-{base}"
@@ -235,10 +293,8 @@ class ParaformerCallback(RecognitionCallback):
             entities: Optional[List[dict]] = None
 
             if is_final:
-                # Optional translation
                 if DO_TRANSLATE and nlp and not language_code.startswith("en"):
                     translated_text = nlp.to_english(text, language_code)
-                # Optional entities (on English text)
                 if DO_ENTITIES and nlp:
                     analysis_text = translated_text or text
                     entities = nlp.detect_entities(analysis_text)
@@ -248,6 +304,7 @@ class ParaformerCallback(RecognitionCallback):
                         "sentence_id": sentence_id,
                         "language_inferred": language_code,
                         "speaker": speaker,
+                        "keys": list(sentence_or_payload.keys()) if isinstance(sentence_or_payload, dict) else None,
                     }
                 )
             else:
@@ -257,6 +314,7 @@ class ParaformerCallback(RecognitionCallback):
                         "sentence_id": sentence_id,
                         "language_inferred": language_code,
                         "speaker": speaker,
+                        "keys": list(sentence_or_payload.keys()) if isinstance(sentence_or_payload, dict) else None,
                     }
                 )
 
@@ -310,7 +368,6 @@ async def transcribe_alibaba(websocket: WebSocket):
                 else:
                     break
         except asyncio.CancelledError:
-            # Normal during shutdown
             if DBG:
                 logger.debug("forward_events task cancelled")
         except Exception as e:
@@ -347,19 +404,36 @@ async def transcribe_alibaba(websocket: WebSocket):
             logger.error("receive_audio error: %s", e)
 
     try:
-        recognizer = Recognition(
-            model="paraformer-realtime-v2",
-            format="pcm",
-            sample_rate=16000,
-            diarization_enabled=True,
-            language_hints=["en", "yue", "zh"],
-            callback=callback,
-            semantic_punctuation_enabled=False,
-            punctuation_prediction_enabled=True,
-            inverse_text_normalization_enabled=True,
-        )
+        # Some SDK versions accept a speaker count parameter; try it and fall back if not supported.
+        try:
+            recognizer = Recognition(
+                model="paraformer-realtime-v2",
+                format="pcm",
+                sample_rate=16000,
+                diarization_enabled=True,
+                # Try to hint max speakers if supported by SDK
+                speaker_number=SPEAKER_COUNT,  # will raise TypeError if unsupported
+                language_hints=["en", "yue", "zh"],
+                callback=callback,
+                semantic_punctuation_enabled=False,
+                punctuation_prediction_enabled=True,
+                inverse_text_normalization_enabled=True,
+            )
+        except TypeError:
+            recognizer = Recognition(
+                model="paraformer-realtime-v2",
+                format="pcm",
+                sample_rate=16000,
+                diarization_enabled=True,
+                language_hints=["en", "yue", "zh"],
+                callback=callback,
+                semantic_punctuation_enabled=False,
+                punctuation_prediction_enabled=True,
+                inverse_text_normalization_enabled=True,
+            )
+
         recognizer.start()
-        logger.info("DashScope recognizer started")
+        logger.info("DashScope recognizer started (diarization enabled, max speakers hint=%s)", SPEAKER_COUNT)
 
         sender_task = asyncio.create_task(forward_events())
         audio_task = asyncio.create_task(receive_audio())
