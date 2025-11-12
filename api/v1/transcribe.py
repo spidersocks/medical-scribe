@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from typing import Any, Dict, Optional, List
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -11,12 +12,16 @@ from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionRes
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Make DashScope a bit quieter unless debugging
+# Enable verbose logging for this module only when needed.
+if os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1":
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
+
 logging.getLogger("dashscope").setLevel(logging.INFO)
 
 
 def _map_lang_to_ui(language: Optional[str]) -> str:
-    # Map Alibaba language tokens to the UI's expected codes
     if not language:
         return "en-US"
     lang = language.lower()
@@ -29,8 +34,13 @@ def _map_lang_to_ui(language: Optional[str]) -> str:
     return "en-US"
 
 
-def _aws_shape(text: str, is_partial: bool, result_id: str, speaker: Optional[str], language: Optional[str]) -> Dict[str, Any]:
-    return {
+def _aws_shape(text: str,
+               is_partial: bool,
+               result_id: str,
+               speaker: Optional[str],
+               language: Optional[str],
+               debug: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
         "Transcript": {
             "Results": [
                 {
@@ -40,14 +50,8 @@ def _aws_shape(text: str, is_partial: bool, result_id: str, speaker: Optional[st
                         {
                             "Transcript": text,
                             "Items": (
-                                [
-                                    {
-                                        "Type": "pronunciation",
-                                        "Speaker": speaker,
-                                    }
-                                ]
-                                if speaker
-                                else []
+                                [{"Type": "pronunciation", "Speaker": speaker}]
+                                if speaker else []
                             ),
                         }
                     ],
@@ -59,12 +63,15 @@ def _aws_shape(text: str, is_partial: bool, result_id: str, speaker: Optional[st
         "TranslatedText": None,
         "ComprehendEntities": [],
     }
+    if debug and os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1":
+        payload["_debug"] = debug
+    return payload
 
 
 class ParaformerCallback(RecognitionCallback):
     """
-    DashScope invokes these synchronously; we push transformed events onto an asyncio.Queue
-    which the WebSocket coroutine drains.
+    Handles both RecognitionResult objects and (if the SDK sends them) raw JSON strings.
+    Emits AWS-shaped payloads onto an asyncio.Queue consumed by the websocket coroutine.
     """
     def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
         self.loop = loop
@@ -72,72 +79,131 @@ class ParaformerCallback(RecognitionCallback):
         self.final_counter = 0
         self.current_partial_id: Optional[str] = None
 
+    def _emit(self, data: Dict[str, Any]) -> None:
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
+
     def on_open(self):
         logger.info("[DashScope] Connection opened")
 
     def on_error(self, message: str):
         logger.error("[DashScope] Error: %s", message)
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, {"_error": True, "message": message})
+        self._emit({"_error": True, "message": message})
 
     def on_close(self):
         logger.info("[DashScope] Connection closed")
 
     def on_complete(self):
         logger.info("[DashScope] Recognition completed")
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, {"_complete": True})
+        self._emit({"_complete": True})
 
     def on_event(self, message: Any):
+        """
+        message may be:
+          - RecognitionResult
+          - str (JSON)
+        """
         try:
-            if not isinstance(message, RecognitionResult):
+            raw_debug: Dict[str, Any] = {}
+            sentence: Dict[str, Any] = {}
+            speaker = None
+            language = None
+            sentence_id = None
+            is_final = False
+            text = ""
+
+            # Case 1: RecognitionResult instance
+            if isinstance(message, RecognitionResult):
+                sentence = message.get_sentence()
+                raw_debug["raw_sentence"] = sentence
+                if not isinstance(sentence, dict):
+                    return
+                text = sentence.get("text") or sentence.get("result") or ""
+                speaker = sentence.get("speaker") or sentence.get("speaker_id")
+                language = sentence.get("language")
+                sentence_id = sentence.get("sentence_id")
+
+                # Try official method first
+                try:
+                    is_final = message.is_sentence_end(sentence)
+                except Exception:
+                    # Fallback flags sometimes appear
+                    is_final = bool(sentence.get("is_sentence_end") or sentence.get("sentence_end"))
+
+            # Case 2: raw JSON string (old style header/payload from earlier version)
+            elif isinstance(message, str):
+                try:
+                    parsed = json.loads(message)
+                    raw_debug["raw_json"] = parsed
+                    header = parsed.get("header", {})
+                    payload = parsed.get("payload", {})
+                    text = payload.get("result") or payload.get("text") or ""
+                    speaker = payload.get("speaker_id") or payload.get("speaker")
+                    language = payload.get("language")
+                    sentence_id = payload.get("sentence_id")
+
+                    name = header.get("name")
+                    # Names from docs: TranscriptionResultChanged (partial), SentenceEnd (final)
+                    if name == "SentenceEnd":
+                        is_final = True
+                    elif name == "TranscriptionResultChanged":
+                        is_final = False
+                    else:
+                        # If we don't recognize the header name, ignore
+                        return
+                except Exception as exc:
+                    logger.debug("Failed to parse raw string event: %s", exc)
+                    return
+            else:
+                # Unknown type
                 return
 
-            sentence = message.get_sentence()
-            if not isinstance(sentence, dict):
-                return
-
-            # Prefer normalized 'text'; fall back to 'result' if present
-            text = sentence.get("text") or sentence.get("result") or ""
             if not text:
-                return
+                return  # nothing to emit
 
-            # Determine final vs partial
-            try:
-                is_final = message.is_sentence_end(sentence)
-            except Exception:
-                # Fallback heuristic if SDK differs
-                is_final = bool(sentence.get("is_sentence_end") or sentence.get("sentence_end"))
-
-            speaker = sentence.get("speaker") or sentence.get("speaker_id")
-            language = sentence.get("language")
-            sent_id = sentence.get("sentence_id")
-
+            # ID generation
             if is_final:
-                # Unique id for EVERY finalized utterance
-                if sent_id is not None:
-                    result_id = f"alibaba-seg-{sent_id}"
+                # ALWAYS unique: uuid4 hex + counter (counter is just for debug ordering)
+                unique_part = uuid.uuid4().hex[:8]
+                if sentence_id is not None:
+                    result_id = f"alibaba-seg-{sentence_id}-{unique_part}"
                 else:
-                    result_id = f"alibaba-seg-{self.final_counter}"
+                    result_id = f"alibaba-seg-{self.final_counter}-{unique_part}"
                 self.final_counter += 1
                 self.current_partial_id = None
             else:
-                # Stable temp id across partial updates of the same sentence
+                # Stable temp id for partials of the current sentence
                 if self.current_partial_id is None:
-                    temp_index = sent_id if sent_id is not None else self.final_counter
-                    self.current_partial_id = f"alibaba-temp-{temp_index}"
+                    base = sentence_id if sentence_id is not None else self.final_counter
+                    self.current_partial_id = f"alibaba-temp-{base}"
                 result_id = self.current_partial_id
 
-            payload = _aws_shape(
+            debug_block = {
+                "is_final": is_final,
+                "result_id": result_id,
+                "sentence_id": sentence_id,
+                "final_counter": self.final_counter,
+                "speaker": speaker,
+                "language": language,
+            }
+            debug_block.update(raw_debug)
+
+            logger.debug(
+                "[DashScope] Emit %s id=%s sentence_id=%s text=%r",
+                "FINAL" if is_final else "PARTIAL",
+                result_id,
+                sentence_id,
+                text[:120],
+            )
+
+            aws_payload = _aws_shape(
                 text=text,
                 is_partial=not is_final,
                 result_id=result_id,
                 speaker=speaker,
                 language=language,
+                debug=debug_block,
             )
-
-            # For quick debugging of overwrites:
-            logger.debug("[DashScope] Emit %s id=%s text=%r", "FINAL" if is_final else "PARTIAL", result_id, text[:80])
-
-            self.loop.call_soon_threadsafe(self.queue.put_nowait, payload)
+            self._emit(aws_payload)
 
         except Exception as e:
             logger.exception("Error in on_event: %s", e)
@@ -147,14 +213,12 @@ class ParaformerCallback(RecognitionCallback):
 async def transcribe_alibaba(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connected (/transcribe/alibaba)")
-
-    # Ensure the DashScope API key is available to the SDK; harmless if already set in env
     os.environ.setdefault("DASHSCOPE_API_KEY", os.getenv("DASHSCOPE_API_KEY", ""))
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     callback = ParaformerCallback(loop, queue)
-    recognizer = None
+    recognizer: Optional[Recognition] = None
 
     async def forward_events():
         try:
@@ -180,7 +244,6 @@ async def transcribe_alibaba(websocket: WebSocket):
             while True:
                 data = await websocket.receive_bytes()
                 if not data:
-                    # End-of-stream from client
                     try:
                         if recognizer:
                             recognizer.send_end_flag()
@@ -209,7 +272,7 @@ async def transcribe_alibaba(websocket: WebSocket):
             format="pcm",
             sample_rate=16000,
             diarization_enabled=True,
-            language_hints=["en", "yue", "zh"],  # auto-detect among English, Cantonese, Mandarin
+            language_hints=["en", "yue", "zh"],
             callback=callback,
             semantic_punctuation_enabled=False,
             punctuation_prediction_enabled=True,
@@ -221,7 +284,10 @@ async def transcribe_alibaba(websocket: WebSocket):
         sender_task = asyncio.create_task(forward_events())
         audio_task = asyncio.create_task(receive_audio())
 
-        done, pending = await asyncio.wait({sender_task, audio_task}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(
+            {sender_task, audio_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         for t in pending:
             t.cancel()
             try:
