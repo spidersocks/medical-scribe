@@ -1,79 +1,60 @@
-"""
-Alibaba Paraformer real-time transcription via RAW WebSocket "run-task" message.
-
-This replaces the previous SDK-based approach so we can explicitly send:
-  diarization_enabled: True
-  speaker_count: <env ALIBABA_SPEAKER_COUNT>
-  enable_words: True
-  format: pcm
-  sample_rate: 16000
-  channel_num: 1
-
-and obtain speaker_id in each sentence (and word-level speakers if the
-service returns them). We then reshape responses into the AWS-style
-payload the existing frontend expects.
-
-Environment variables used:
-  DASHSCOPE_API_KEY          (required)
-  ALIBABA_SPEAKER_COUNT      (optional, default 2)
-  DEBUG_ALIBABA_TRANSCRIBE   (optional, set to '1' for verbose debug)
-  ENABLE_ALIBABA_TRANSLATION (optional '1')
-  ENABLE_ALIBABA_ENTITIES    (optional '1')
-
-If translation/entities flags are set and services.nlp is available,
-we run lightweight enrichment per final segment.
-
-Endpoint (unchanged for the frontend):
-  ws://<host>/transcribe/alibaba
-"""
 import asyncio
 import json
 import logging
 import os
-import uuid
 import time
+import uuid
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
+# Optional enrichment (translation + entities via AWS Comprehend Medical)
 try:
-    from services import nlp  # translate + entities
+    from services import nlp
 except ImportError:
-    nlp = None
+    nlp = None  # graceful degradation
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# -------------------- Flags / Config --------------------
+# -------------------- Configuration / Flags --------------------
 DBG = os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1"
 DO_TRANSLATE = os.getenv("ENABLE_ALIBABA_TRANSLATION") == "1"
 DO_ENTITIES = os.getenv("ENABLE_ALIBABA_ENTITIES") == "1"
+FAKE_DIARIZATION = os.getenv("ALIBABA_FAKE_DIARIZATION") == "1"  # fallback turn-taking assignment
 SPEAKER_COUNT = int(os.getenv("ALIBABA_SPEAKER_COUNT", "2"))
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-
-# Official raw inference WebSocket (run-task)
-ALIBABA_WS_URL = os.getenv(
-    "ALIBABA_INFERENCE_WS_URL",
-    "wss://dashscope.aliyuncs.com/api-ws/v1/inference/",
-)
+MAX_FAKE_SPEAKERS = max(2, SPEAKER_COUNT)
 
 if DBG:
     logger.setLevel(logging.DEBUG)
 else:
     logger.setLevel(logging.INFO)
 
+logging.getLogger("dashscope").setLevel(logging.INFO)
+
 # -------------------- Language Mapping / Heuristics --------------------
-CANTONESE_HINT_CHARS = set("嘅咩喺咗冇哋啲呢啦噉仲咪睇醫")
+CANTONESE_HINT_CHARS = set("嘅咩喺咗冇哋啲呢啦噉仲咪睇醫")  # crude heuristic for Cantonese
 
 def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
+    """
+    Map Paraformer language token (if present) OR infer from text.
+    Preference order:
+      - Explicit lang_raw
+      - CJK detection + Cantonese char heuristic
+      - Default English
+    """
     if lang_raw:
         lr = lang_raw.lower()
-        if lr.startswith("en"): return "en-US"
-        if "yue" in lr or "cant" in lr: return "zh-HK"
-        if lr.startswith("zh"): return "zh-TW"
+        if lr.startswith("en"):
+            return "en-US"
+        if "yue" in lr or "cant" in lr:
+            return "zh-HK"
+        if lr.startswith("zh"):
+            return "zh-TW"
+    # Heuristic fallback
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         if any(ch in CANTONESE_HINT_CHARS for ch in text):
             return "zh-HK"
@@ -84,20 +65,28 @@ def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
 WORD_SPEAKER_KEYS = ("speaker", "spk", "speaker_id", "spk_id")
 
 def _norm_spk(val: Any) -> Optional[str]:
-    if val is None: return None
+    if val is None:
+        return None
     s = str(val).strip()
-    if not s: return None
-    if s.startswith("spk_"): return s
+    if not s:
+        return None
+    if s.startswith("spk_"):
+        return s
     digits = "".join(ch for ch in s if ch.isdigit())
-    if digits: return f"spk_{int(digits)}"
-    if s.isdigit(): return f"spk_{int(s)}"
+    if digits:
+        return f"spk_{int(digits)}"
+    # Accept simple integer-like strings
+    if s.isdigit():
+        return f"spk_{int(s)}"
     return s.lower()
 
 def extract_majority_word_speaker(words: Any) -> Optional[str]:
-    if not isinstance(words, list) or not words: return None
+    if not isinstance(words, list) or not words:
+        return None
     speakers: List[str] = []
     for w in words:
-        if not isinstance(w, dict): continue
+        if not isinstance(w, dict):
+            continue
         raw = None
         for k in WORD_SPEAKER_KEYS:
             if k in w:
@@ -108,22 +97,29 @@ def extract_majority_word_speaker(words: Any) -> Optional[str]:
             speakers.append(sp)
     if not speakers:
         return None
-    winner, _ = Counter(speakers).most_common(1)[0]
+    counts = Counter(speakers)
+    winner, _ = counts.most_common(1)[0]
     return winner
 
 def extract_sentence_speaker(sentence: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """
+    Attempt speaker extraction from sentence-level fields first, then word-level majority.
+    Returns (speaker_label, source_tag)
+    source_tag: 'sentence', 'words', 'fake', or 'none'
+    """
     for key in ("speaker", "speaker_id", "spk", "spk_id"):
         raw = sentence.get(key)
         sp = _norm_spk(raw)
         if sp:
             return sp, "sentence"
-    words = sentence.get("words")
+
+    words = sentence.get("words") or sentence.get("word") or sentence.get("tokens") or sentence.get("Tokens")
     sp_words = extract_majority_word_speaker(words)
     if sp_words:
         return sp_words, "words"
     return None, "none"
 
-# -------------------- AWS-Shaped Payload --------------------
+# -------------------- AWS-Shaped Payload Construction --------------------
 def build_aws_payload(
     *,
     text: str,
@@ -140,10 +136,16 @@ def build_aws_payload(
     items = []
     if speaker:
         items.append({"Type": "pronunciation", "Speaker": speaker})
+
     result_obj: Dict[str, Any] = {
         "ResultId": result_id,
         "IsPartial": is_partial,
-        "Alternatives": [{"Transcript": text, "Items": items}],
+        "Alternatives": [
+            {
+                "Transcript": text,
+                "Items": items,
+            }
+        ],
         "LanguageCode": language_code,
     }
     if speaker:
@@ -152,6 +154,7 @@ def build_aws_payload(
         result_obj["StartTimeMs"] = start_ms
     if end_ms is not None:
         result_obj["EndTimeMs"] = end_ms
+
     payload: Dict[str, Any] = {
         "Transcript": {"Results": [result_obj]},
         "DisplayText": text,
@@ -162,232 +165,333 @@ def build_aws_payload(
         payload["_debug"] = debug
     return payload
 
-# -------------------- Alibaba Message Helpers --------------------
-def build_run_task_message() -> Dict[str, Any]:
+# -------------------- Callback --------------------
+class ParaformerCallback(RecognitionCallback):
     """
-    Raw 'run-task' frame per Alibaba guidance.
+    Translate DashScope events (RecognitionResult or raw JSON) into AWS-like streaming payloads.
+    Handles:
+      - Unique result IDs
+      - Partial vs final distinction
+      - Language mapping
+      - Speaker diarization (real or fake fallback)
+      - Optional translation & entity extraction
+      - Timing based on SDK's begin_time / end_time fields (preferred) else wall-clock
     """
-    task_id = str(uuid.uuid4())
-    return {
-        "header": {
-            "action": "run-task",
-            "task_id": task_id,
-            "streaming": "duplex",
-        },
-        "payload": {
-            "task_group": "audio",
-            "task": "asr",
-            "function": "recognition",
-            "model": "paraformer-realtime-v2",
-            "parameters": {
-                "format": "pcm",
-                "sample_rate": 16000,
-                "diarization_enabled": True,
-                "speaker_count": SPEAKER_COUNT,     # optional guidance
-                "enable_words": True,               # request word-level tokens
-                "channel_num": 1,                   # mono requirement
-                "enable_punctuation_prediction": True,
-                "enable_inverse_text_normalization": True,
-            },
-            "input": {},  # real-time audio will follow as binary frames
-        },
-    }
 
-def parse_incoming(text_data: str) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """
-    Returns (sentence_dict, is_final).
-    The 'payload' may contain either 'sentence' (final) or 'result' (interim) depending on API version.
-    We standardize to a sentence dict with keys we use downstream.
-    """
-    try:
-        obj = json.loads(text_data)
-    except Exception:
-        return None, False
+    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
+        self.loop = loop
+        self.queue = queue
+        self.session_start_monotonic = time.monotonic()
+        self.final_counter = 0
+        self.current_partial_id: Optional[str] = None
+        self.last_final_speaker: Optional[str] = None
+        self.fake_turn_state: List[str] = []  # maintain encountered speakers if fake diarization engaged
 
-    payload = obj.get("payload") or {}
-    # The real-time responses usually embed recognized sentence here:
-    # - payload["sentence"] for final
-    # - payload["sentence"]["text"] partial updates with 'is_sentence_end': False
-    sentence = payload.get("sentence")
-    if not isinstance(sentence, dict):
-        # Some versions might use 'result' for partial. Try fallback.
-        sentence = payload.get("result")
+    def _emit(self, data: Dict[str, Any]) -> None:
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
 
-    if not isinstance(sentence, dict):
-        return None, False
+    def on_open(self):
+        logger.info("[Alibaba] Connection opened")
 
-    # Determine final: speaker diarization doc says 'is_sentence_end' or 'sentence_end'
-    is_final = bool(
-        sentence.get("is_sentence_end")
-        or sentence.get("sentence_end")
-        or sentence.get("end_time")  # sentences with end_time usually are final
-    )
-    return sentence, is_final
+    def on_error(self, message: str):
+        logger.error("[Alibaba] Error: %s", message)
+        self._emit({"_error": True, "message": message})
+
+    def on_close(self):
+        logger.info("[Alibaba] Connection closed")
+
+    def on_complete(self):
+        logger.info("[Alibaba] Recognition completed")
+        self._emit({"_complete": True})
+
+    # Utility for fallback timing if begin_time is missing
+    def _rel_ms(self) -> int:
+        return int((time.monotonic() - self.session_start_monotonic) * 1000)
+
+    def _assign_fake_speaker(self) -> str:
+        """
+        Simple turn-taking heuristic:
+        - First speaker => spk_0
+        - Next distinct turn => spk_1
+        - If >2 required, cycle spk_2, spk_3 ...
+        """
+        if not self.fake_turn_state:
+            self.fake_turn_state.append("spk_0")
+            return "spk_0"
+        if len(self.fake_turn_state) == 1:
+            self.fake_turn_state.append("spk_1")
+            return "spk_1"
+        # Cycle if more needed
+        next_index = len(self.fake_turn_state)
+        spk_label = f"spk_{next_index % MAX_FAKE_SPEAKERS}"
+        self.fake_turn_state.append(spk_label)
+        return spk_label
+
+    def _parse_raw_json(self, raw_str: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], bool]]:
+        try:
+            obj = json.loads(raw_str)
+        except Exception:
+            return None
+        header = obj.get("header", {}) or {}
+        payload = obj.get("payload", {}) or {}
+        name = header.get("name")
+        if name == "TranscriptionResultChanged":
+            is_final = False
+        elif name == "SentenceEnd":
+            is_final = True
+        else:
+            return None
+        return header, payload, is_final
+
+    def on_event(self, message: Any):
+        try:
+            # Normalize into "sentence" dict and final flag.
+            sentence: Dict[str, Any] = {}
+            is_final = False
+            raw_debug: Dict[str, Any] = {}
+            if isinstance(message, RecognitionResult):
+                # SDK object
+                sent = message.get_sentence()
+                if not isinstance(sent, dict):
+                    return
+                sentence = sent
+                raw_debug["raw_sentence_keys"] = list(sent.keys())
+                try:
+                    is_final = message.is_sentence_end(sent)
+                except Exception:
+                    is_final = bool(sent.get("sentence_end") or sent.get("is_sentence_end"))
+            elif isinstance(message, str):
+                parsed = self._parse_raw_json(message)
+                if not parsed:
+                    return
+                header, payload, is_final = parsed
+                sentence = payload
+                raw_debug["raw_header"] = header
+                raw_debug["raw_payload_keys"] = list(payload.keys())
+            else:
+                return
+
+            text = sentence.get("text") or sentence.get("result") or ""
+            if not text:
+                return
+
+            # Times (prefer SDK begin_time / end_time)
+            begin_time_raw = sentence.get("begin_time")
+            end_time_raw = sentence.get("end_time")
+            try:
+                start_ms = int(begin_time_raw) if begin_time_raw is not None else self._rel_ms()
+            except Exception:
+                start_ms = self._rel_ms()
+            try:
+                end_ms = int(end_time_raw) if (is_final and end_time_raw is not None) else None
+            except Exception:
+                end_ms = self._rel_ms() if is_final else None
+
+            sentence_id = sentence.get("sentence_id")
+            lang_raw = sentence.get("language") or sentence.get("lang") or sentence.get("language_code")
+            language_code = map_lang_to_ui(lang_raw, text)
+
+            # Speaker extraction
+            speaker_label, source_tag = extract_sentence_speaker(sentence)
+
+            # Fake diarization fallback if absent
+            if speaker_label is None and is_final and FAKE_DIARIZATION:
+                speaker_label = self._assign_fake_speaker()
+                source_tag = "fake"
+
+            # Maintain last_final_speaker (could assist other heuristics later)
+            if is_final and speaker_label:
+                self.last_final_speaker = speaker_label
+
+            # Unique IDs
+            if is_final:
+                unique_suffix = uuid.uuid4().hex[:8]
+                if sentence_id is not None:
+                    result_id = f"alibaba-seg-{sentence_id}-{unique_suffix}"
+                else:
+                    result_id = f"alibaba-seg-{self.final_counter}-{unique_suffix}"
+                self.final_counter += 1
+                self.current_partial_id = None
+            else:
+                if self.current_partial_id is None:
+                    base = sentence_id if sentence_id is not None else self.final_counter
+                    self.current_partial_id = f"alibaba-temp-{base}"
+                result_id = self.current_partial_id
+
+            translated_text: Optional[str] = None
+            entities: Optional[List[dict]] = None
+            if is_final:
+                if DO_TRANSLATE and nlp and not language_code.startswith("en"):
+                    translated_text = nlp.to_english(text, language_code)
+                if DO_ENTITIES and nlp:
+                    analysis_text = translated_text or text
+                    entities = nlp.detect_entities(analysis_text)
+
+            if DBG:
+                raw_debug.update(
+                    {
+                        "sentence_id": sentence_id,
+                        "is_final": is_final,
+                        "speaker_extracted": speaker_label,
+                        "speaker_source": source_tag,
+                        "language_raw": lang_raw,
+                        "language_final": language_code,
+                        "begin_time": begin_time_raw,
+                        "end_time": end_time_raw,
+                        "result_id": result_id,
+                        "final_counter": self.final_counter,
+                        "fake_diarization": FAKE_DIARIZATION,
+                    }
+                )
+
+            payload = build_aws_payload(
+                text=text,
+                is_partial=not is_final,
+                result_id=result_id,
+                speaker=speaker_label,
+                language_code=language_code,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                translated_text=translated_text,
+                entities=entities,
+                debug=raw_debug if DBG else None,
+            )
+            self._emit(payload)
+
+        except Exception as exc:
+            logger.exception("Error in on_event: %s", exc)
 
 # -------------------- WebSocket Endpoint --------------------
 @router.websocket("/alibaba")
 async def transcribe_alibaba(websocket: WebSocket):
-    """
-    Raw WebSocket bridge:
-      1. Accept browser connection.
-      2. Open Alibaba inference WebSocket.
-      3. Send run-task message with diarization + words enabled.
-      4. Forward PCM 16k mono frames from browser to Alibaba.
-      5. Convert Alibaba responses to existing AWS-shaped payloads.
-    """
     await websocket.accept()
-    logger.info("Client connected -> /transcribe/alibaba")
+    logger.info("WebSocket connected (/transcribe/alibaba)")
+    os.environ.setdefault("DASHSCOPE_API_KEY", os.getenv("DASHSCOPE_API_KEY", ""))
 
-    if not API_KEY:
-        await websocket.close(code=1011, reason="DASHSCOPE_API_KEY missing")
-        return
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    callback = ParaformerCallback(loop, queue)
+    recognizer: Optional[Recognition] = None
 
-    # Track segment IDs
-    final_counter = 0
-
-    async with aiohttp.ClientSession() as session:
+    async def forward_events():
         try:
-            upstream = await session.ws_connect(
-                ALIBABA_WS_URL,
-                headers={"Authorization": f"bearer {API_KEY}"},
-                max_msg_size=0,
-            )
-        except Exception as exc:
-            logger.exception("Failed to connect to Alibaba ASR: %s", exc)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close(code=1011, reason="Upstream unavailable")
-            return
-
-        # Send run-task
-        start_msg = build_run_task_message()
-        await upstream.send_str(json.dumps(start_msg))
-        logger.info("Sent run-task (diarization_enabled=True, speaker_count=%s, enable_words=True)", SPEAKER_COUNT)
-
-        # For timing fallback if begin_time/end_time unreliable
-        session_start_monotonic = time.monotonic()
-
-        async def forward_audio():
-            try:
-                while True:
-                    data = await websocket.receive_bytes()
-                    if not data:
-                        # No more audio – simply stop sending frames.
-                        break
-                    await upstream.send_bytes(data)
-            except WebSocketDisconnect:
-                logger.info("Client disconnected (audio).")
-            except Exception as e:
-                logger.error("forward_audio error: %s", e)
-
-        async def forward_results():
-            nonlocal final_counter
-            try:
-                async for msg in upstream:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        sentence, is_final = parse_incoming(msg.data)
-                        if not isinstance(sentence, dict):
-                            continue
-
-                        text = sentence.get("text") or ""
-                        if not text:
-                            continue
-
-                        # Timing
-                        try:
-                            start_ms = int(sentence.get("begin_time")) if sentence.get("begin_time") is not None else None
-                        except Exception:
-                            start_ms = None
-                        try:
-                            end_ms = int(sentence.get("end_time")) if (is_final and sentence.get("end_time") is not None) else None
-                        except Exception:
-                            end_ms = None
-
-                        if start_ms is None:
-                            # Fallback approximate timing
-                            start_ms = int((time.monotonic() - session_start_monotonic) * 1000)
-
-                        sentence_id = sentence.get("sentence_id")
-                        lang_raw = sentence.get("language") or sentence.get("lang") or sentence.get("language_code")
-                        language_code = map_lang_to_ui(lang_raw, text)
-
-                        # Speaker extraction
-                        speaker_label, speaker_source = extract_sentence_speaker(sentence)
-
-                        # Unique ID
-                        if is_final:
-                            final_counter += 1
-                            rid = f"alibaba-seg-{sentence_id if sentence_id is not None else final_counter}-{uuid.uuid4().hex[:8]}"
-                        else:
-                            rid = f"alibaba-temp-{sentence_id if sentence_id is not None else final_counter}"
-
-                        translated_text: Optional[str] = None
-                        entities: Optional[List[dict]] = None
-                        if is_final:
-                            if DO_TRANSLATE and nlp and not language_code.startswith("en"):
-                                translated_text = nlp.to_english(text, language_code)
-                            if DO_ENTITIES and nlp:
-                                analysis = translated_text or text
-                                entities = nlp.detect_entities(analysis)
-
-                        debug_block = None
-                        if DBG:
-                            word0_keys = None
-                            words = sentence.get("words")
-                            if isinstance(words, list) and words and isinstance(words[0], dict):
-                                word0_keys = list(words[0].keys())
-                            debug_block = {
-                                "sentence_id": sentence_id,
-                                "is_final": is_final,
-                                "speaker_extracted": speaker_label,
-                                "speaker_source": speaker_source,
-                                "language_raw": lang_raw,
-                                "language_final": language_code,
-                                "begin_time": sentence.get("begin_time"),
-                                "end_time": sentence.get("end_time"),
-                                "word0_keys": word0_keys,
-                                "result_id": rid,
-                            }
-
-                        payload = build_aws_payload(
-                            text=text,
-                            is_partial=not is_final,
-                            result_id=rid,
-                            speaker=speaker_label,
-                            language_code=language_code,
-                            start_ms=start_ms,
-                            end_ms=end_ms,
-                            translated_text=translated_text,
-                            entities=entities,
-                            debug=debug_block,
-                        )
-
+            while True:
+                item = await queue.get()
+                if isinstance(item, dict):
+                    if item.get("_error"):
                         if websocket.client_state == WebSocketState.CONNECTED:
-                            await websocket.send_text(json.dumps(payload))
-
-                    elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                            await websocket.close(code=1011, reason=item.get("message") or "Transcription service error")
                         break
-            except Exception as e:
-                logger.error("forward_results error: %s", e)
+                    if item.get("_complete"):
+                        if websocket.client_state == WebSocketState.CONNECTED:
+                            await websocket.close()
+                        break
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        await websocket.send_text(json.dumps(item))
+                    else:
+                        break
+        except asyncio.CancelledError:
+            if DBG:
+                logger.debug("forward_events cancelled")
+        except Exception as e:
+            logger.error("forward_events error: %s", e)
 
-        # Run both directions concurrently
+    async def receive_audio():
         try:
-            t_audio = asyncio.create_task(forward_audio())
-            t_results = asyncio.create_task(forward_results())
-            done, pending = await asyncio.wait({t_audio, t_results}, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
+            while True:
+                data = await websocket.receive_bytes()
+                if not data:
+                    # zero-length frame signals end
+                    try:
+                        if recognizer:
+                            recognizer.send_end_flag()
+                    except Exception:
+                        pass
+                    break
                 try:
-                    await t
-                except Exception:
-                    pass
-        finally:
+                    if recognizer:
+                        recognizer.send_audio_frame(data)
+                except Exception as e:
+                    logger.error("send_audio_frame error: %s", e)
+                    break
+        except WebSocketDisconnect:
+            logger.info("Client disconnected (WebSocketDisconnect)")
             try:
-                await upstream.close()
+                if recognizer:
+                    recognizer.send_end_flag()
             except Exception:
                 pass
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.close()
-                except Exception:
-                    pass
-            logger.info("Alibaba transcription session ended (raw WebSocket).")
+        except asyncio.CancelledError:
+            if DBG:
+                logger.debug("receive_audio cancelled")
+        except Exception as e:
+            logger.error("receive_audio error: %s", e)
+
+    try:
+        # Use correct diarization parameter name speaker_count (newer SDK)
+        try:
+            recognizer = Recognition(
+                model="paraformer-realtime-v2",
+                format="pcm",
+                sample_rate=16000,
+                diarization_enabled=True,
+                speaker_count=SPEAKER_COUNT,
+                language_hints=["en", "yue", "zh"],
+                callback=callback,
+                semantic_punctuation_enabled=False,
+                punctuation_prediction_enabled=True,
+                inverse_text_normalization_enabled=True,
+            )
+        except TypeError:
+            # Fallback if SDK doesn't support speaker_count
+            logger.warning("DashScope SDK missing speaker_count parameter; continuing without it.")
+            recognizer = Recognition(
+                model="paraformer-realtime-v2",
+                format="pcm",
+                sample_rate=16000,
+                diarization_enabled=True,
+                language_hints=["en", "yue", "zh"],
+                callback=callback,
+                semantic_punctuation_enabled=False,
+                punctuation_prediction_enabled=True,
+                inverse_text_normalization_enabled=True,
+            )
+
+        recognizer.start()
+        logger.info(
+            "DashScope recognizer started (diarization_enabled=True, speaker_count_hint=%s, fake_diarization=%s)",
+            SPEAKER_COUNT,
+            FAKE_DIARIZATION,
+        )
+
+        sender_task = asyncio.create_task(forward_events())
+        audio_task = asyncio.create_task(receive_audio())
+
+        done, pending = await asyncio.wait(
+            {sender_task, audio_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        for task in done:
+            if task.exception():
+                logger.error("Task finished with exception: %s", task.exception())
+
+    except Exception as e:
+        logger.exception("Transcription session error: %s", e)
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close(code=1011, reason=str(e))
+            except Exception:
+                pass
+    finally:
+        if recognizer:
+            try:
+                recognizer.stop()
+            except Exception:
+                pass
+        logger.info("Alibaba transcription session ended")
