@@ -5,7 +5,7 @@ from . import (
     consultations,
     patients,
     templates,
-    transcribe,  # Add this
+    transcribe,
     transcript_segments,
     users,
 )
@@ -18,4 +18,4 @@ api_router.include_router(consultations.router, prefix="/consultations", tags=["
 api_router.include_router(transcript_segments.router, prefix="/transcript-segments", tags=["transcript-segments"])
 api_router.include_router(clinical_notes.router, prefix="/clinical-notes", tags=["clinical-notes"])
 api_router.include_router(templates.router, prefix="/templates", tags=["templates"])
-api_router.include_router(transcribe.router, prefix="/transcribe", tags=["transcribe"])  # And this
+api_router.include_router(transcribe.router, prefix="/transcribe", tags=["transcribe"])
