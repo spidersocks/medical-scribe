@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from typing import List, Optional, Dict, Any
+from collections.abc import Mapping
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -20,27 +21,111 @@ except Exception:  # pragma: no cover
     RecognitionResult = None  # type: ignore
 
 
-def _extract_sentence(obj: Any) -> Optional[Dict[str, Any]]:
-    """
-    Extract the 'sentence' dict from:
-      - RecognitionResult object (obj.sentence)
-      - Plain dict with 'sentence'
-      - Already a sentence dict
-    Returns None if not found.
-    """
-    if obj is None:
+def _safe_get(d: Any, key: str, default=None):
+    """Get key from dict-like object without raising KeyError."""
+    try:
+        if isinstance(d, dict):
+            return d.get(key, default)
+        if isinstance(d, Mapping):
+            return d.get(key, default)
+        # Some SDK objects implement .get
+        if hasattr(d, "get") and callable(getattr(d, "get")):
+            return d.get(key, default)
+    except Exception:
+        pass
+    return default
+
+
+def _word_to_dict(w: Any) -> Dict[str, Any]:
+    """Normalize a word object/dict into a plain dict with text/times/speaker."""
+    if isinstance(w, dict):
+        return {
+            "text": w.get("text") or w.get("content") or w.get("word") or "",
+            "begin_time": w.get("begin_time") or w.get("start") or w.get("start_time") or w.get("StartTimeMs"),
+            "end_time": w.get("end_time") or w.get("end") or w.get("end_time") or w.get("EndTimeMs"),
+            "speaker": w.get("speaker") or w.get("spk") or w.get("Speaker"),
+        }
+    # object with attributes
+    out = {
+        "text": getattr(w, "text", "") or getattr(w, "content", "") or getattr(w, "word", ""),
+        "begin_time": getattr(w, "begin_time", None) or getattr(w, "start", None) or getattr(w, "start_time", None),
+        "end_time": getattr(w, "end_time", None) or getattr(w, "end", None) or getattr(w, "end_time", None),
+        "speaker": getattr(w, "speaker", None) or getattr(w, "spk", None),
+    }
+    return out
+
+
+def _sentence_to_dict(s: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a sentence object/dict into a plain dict with the expected keys."""
+    if s is None:
         return None
-    # RecognitionResult object
-    if RecognitionResult and isinstance(obj, RecognitionResult):
-        return getattr(obj, "sentence", None)
-    # Dict wrapper
-    if isinstance(obj, dict):
-        if "sentence" in obj and isinstance(obj["sentence"], dict):
-            return obj["sentence"]
-        # Maybe it's already the sentence
-        sentence_keys = {"text", "begin_time", "end_time", "words"}
-        if sentence_keys.intersection(obj.keys()):
-            return obj
+    if isinstance(s, dict):
+        # already dict-like
+        words = s.get("words") or []
+        words_norm = [_word_to_dict(w) for w in words] if isinstance(words, list) else []
+        return {
+            "text": s.get("text") or s.get("result") or "",
+            "begin_time": s.get("begin_time"),
+            "end_time": s.get("end_time"),
+            "words": words_norm,
+            "sentence_end": bool(s.get("sentence_end") or s.get("is_final") or s.get("final")),
+            "speaker": s.get("speaker"),
+            "language": s.get("language"),
+        }
+    # object path
+    try:
+        words = getattr(s, "words", None) or []
+        words_norm = [_word_to_dict(w) for w in words] if isinstance(words, list) else []
+        return {
+            "text": getattr(s, "text", "") or getattr(s, "result", "") or "",
+            "begin_time": getattr(s, "begin_time", None),
+            "end_time": getattr(s, "end_time", None),
+            "words": words_norm,
+            "sentence_end": bool(getattr(s, "sentence_end", False) or getattr(s, "is_final", False)),
+            "speaker": getattr(s, "speaker", None),
+            "language": getattr(s, "language", None),
+        }
+    except Exception:
+        return None
+
+
+def _extract_sentence(msg: Any) -> Optional[Dict[str, Any]]:
+    """
+    Extract a normalized 'sentence' dict from:
+      - RecognitionResult object (msg.sentence)
+      - Plain dict with 'sentence' OR already a sentence dict
+      - JSON string
+    Returns None if not found or not usable.
+    """
+    # JSON string path
+    if isinstance(msg, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(msg.decode() if isinstance(msg, (bytes, bytearray)) else msg)
+        except Exception:
+            return None
+        return _extract_sentence(parsed)
+
+    # RecognitionResult object path
+    if RecognitionResult and isinstance(msg, RecognitionResult):
+        return _sentence_to_dict(getattr(msg, "sentence", None))
+
+    # Generic object with .sentence attribute
+    if hasattr(msg, "sentence"):
+        return _sentence_to_dict(getattr(msg, "sentence"))
+
+    # Mapping/dict path
+    if isinstance(msg, dict) or isinstance(msg, Mapping):
+        maybe_sentence = _safe_get(msg, "sentence")
+        if isinstance(maybe_sentence, (dict, Mapping)) or hasattr(maybe_sentence, "__dict__"):
+            return _sentence_to_dict(maybe_sentence)
+        # Some SDK variants flatten the sentence at top-level
+        keys = set(getattr(msg, "keys", lambda: [])())
+        if keys & {"text", "begin_time", "end_time", "words"}:
+            return _sentence_to_dict(msg)
+        # Some send {"result": "...", "sentence_end": bool}
+        if "result" in keys or "sentence_end" in keys:
+            return _sentence_to_dict(msg)
+
     return None
 
 
@@ -53,12 +138,13 @@ def _to_aws_shape(sentence: Dict[str, Any], result_counter: int) -> Dict[str, An
     if not sentence:
         return {}
 
-    text = sentence.get("text") or ""
-    if not text.strip():
+    text = (sentence.get("text") or "").strip()
+    if not text:
         return {}
 
     sentence_end = bool(sentence.get("sentence_end"))
     is_partial = not sentence_end  # invert
+    language = sentence.get("language")
 
     # Speaker extraction: prefer sentence-level speaker, else first word with speaker
     speaker = sentence.get("speaker")
@@ -77,7 +163,6 @@ def _to_aws_shape(sentence: Dict[str, Any], result_counter: int) -> Dict[str, An
             continue
         begin = w.get("begin_time")
         end = w.get("end_time")
-        # AWS Items expect Type + Transcript-like text per word (we only need Speaker for UI)
         itm: Dict[str, Any] = {
             "Type": "pronunciation",
             "Content": w_text,
@@ -106,8 +191,7 @@ def _to_aws_shape(sentence: Dict[str, Any], result_counter: int) -> Dict[str, An
                             "Items": items,
                         }
                     ],
-                    # LanguageCode is unknown here; Paraformer may not return it per sentence.
-                    "LanguageCode": None,
+                    "LanguageCode": language,
                 }
             ]
         },
@@ -173,22 +257,29 @@ async def transcribe_alibaba(ws: WebSocket):
             message may be:
               - RecognitionResult object
               - dict with 'sentence'
-              - dict already shaped like your example
-              - JSON string (older versions / alternate mode)
+              - dict already shaped like {sentence:{...}}
+              - JSON string
             """
             nonlocal result_counter
             try:
-                parsed: Any = message
-                if isinstance(message, str):
-                    # JSON string path
-                    parsed = json.loads(message)
+                # Minimal structural debug without logging PHI
+                try:
+                    cls = type(message).__name__
+                    debug_info = {}
+                    if isinstance(message, Mapping):
+                        keys = list(getattr(message, "keys", lambda: [])())
+                        debug_info["keys"] = keys[:8]
+                    else:
+                        debug_info["has_sentence_attr"] = hasattr(message, "sentence")
+                        debug_info["has_to_dict"] = hasattr(message, "to_dict")
+                    logger.debug("DashScope on_event type=%s info=%s", cls, debug_info)
+                except Exception:
+                    pass
 
-                sentence = _extract_sentence(parsed)
+                sentence = _extract_sentence(message)
                 if not sentence:
-                    # Could be usage/events we ignore
                     return
 
-                # Increment counter only when we have a sentence with text
                 if sentence.get("text"):
                     result_counter += 1
 
