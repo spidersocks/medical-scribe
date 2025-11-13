@@ -30,4 +30,5 @@ CORE_PRINCIPLES = """
 2. **USE PROVIDED PATIENT INFORMATION:** If patient information is provided, use it appropriately in your note.
 3. **Fact-Check for Consistency:** Re-read the transcript and your note to ensure consistency.
 4. **CRITICAL: VALID JSON SYNTAX:** Ensure all JSON is perfectly formatted with proper quotes around all keys and string values.
+5. If there is truly insufficient medical information in the transcript, do NOT fabricate content. Instead, respond with a valid JSON object: {"error": "insufficient_medical_information"}. Do not produce any additional dialogue, clinical details, or roles that are not present in the transcript.
 """

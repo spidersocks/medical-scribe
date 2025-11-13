@@ -730,7 +730,7 @@ def register_routes(app: FastAPI) -> None:
             ents_compact = _filter_and_compact_entities_for_llm(entities)
 
             # --- NEW: Medical detail validation ---
-            MIN_TRANSCRIPT_LENGTH = 80  # Tweak to your preference
+            MIN_TRANSCRIPT_LENGTH = 50
 
             if len(english_transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
                 raise HTTPException(
