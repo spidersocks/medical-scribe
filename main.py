@@ -27,6 +27,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 # Application-specific imports
 from prompts import PROMPT_REGISTRY, get_prompt_generator
+from services import template_service 
 from config import settings  # <--- IMPORT FROM THE NEW FILE
 
 logger = logging.getLogger(__name__)
@@ -727,6 +728,23 @@ def register_routes(app: FastAPI) -> None:
             entities = entities_response.get("Entities", []) or []
             logger.info("Comprehend Medical returned %d entities.", len(entities))
             ents_compact = _filter_and_compact_entities_for_llm(entities)
+
+            # --- NEW: Medical detail validation ---
+            MIN_TRANSCRIPT_LENGTH = 80  # Tweak to your preference
+
+            if len(english_transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transcript too short—contains insufficient medical detail for note generation."
+                )
+
+            medical_ents = [e for e in ents_compact.get("ents", []) 
+                            if e["c"] in ("MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY")]
+            if not medical_ents:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transcript contains insufficient medical detail for note generation."
+                )
 
             # Mask PHI entities in the transcript before sending to the LLM
             english_transcript_masked = _mask_phi_entities(english_transcript, entities)

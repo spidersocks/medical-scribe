@@ -4,29 +4,24 @@ import logging
 import os
 import time
 import uuid
-from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
-# Optional enrichment (translation + entities via AWS Comprehend Medical)
+# Optional enrichment (translation + entities via AWS services)
 try:
     from services import nlp
 except ImportError:
-    nlp = None  # graceful degradation
+    nlp = None
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# -------------------- Configuration / Flags --------------------
 DBG = os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1"
 DO_TRANSLATE = os.getenv("ENABLE_ALIBABA_TRANSLATION") == "1"
 DO_ENTITIES = os.getenv("ENABLE_ALIBABA_ENTITIES") == "1"
-FAKE_DIARIZATION = os.getenv("ALIBABA_FAKE_DIARIZATION") == "1"  # fallback turn-taking assignment
-SPEAKER_COUNT = int(os.getenv("ALIBABA_SPEAKER_COUNT", "2"))
-MAX_FAKE_SPEAKERS = max(2, SPEAKER_COUNT)
 
 if DBG:
     logger.setLevel(logging.DEBUG)
@@ -35,17 +30,9 @@ else:
 
 logging.getLogger("dashscope").setLevel(logging.INFO)
 
-# -------------------- Language Mapping / Heuristics --------------------
-CANTONESE_HINT_CHARS = set("嘅咩喺咗冇哋啲呢啦噉仲咪睇醫")  # crude heuristic for Cantonese
-
+# --- Language mapping / heuristic (unchanged) ---
+CANTONESE_HINT_CHARS = set("嘅咩喺咗冇哋啲呢啦噉仲咪睇醫")
 def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
-    """
-    Map Paraformer language token (if present) OR infer from text.
-    Preference order:
-      - Explicit lang_raw
-      - CJK detection + Cantonese char heuristic
-      - Default English
-    """
     if lang_raw:
         lr = lang_raw.lower()
         if lr.startswith("en"):
@@ -54,72 +41,13 @@ def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
             return "zh-HK"
         if lr.startswith("zh"):
             return "zh-TW"
-    # Heuristic fallback
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         if any(ch in CANTONESE_HINT_CHARS for ch in text):
             return "zh-HK"
         return "zh-TW"
     return "en-US"
 
-# -------------------- Speaker Extraction --------------------
-WORD_SPEAKER_KEYS = ("speaker", "spk", "speaker_id", "spk_id")
-
-def _norm_spk(val: Any) -> Optional[str]:
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s:
-        return None
-    if s.startswith("spk_"):
-        return s
-    digits = "".join(ch for ch in s if ch.isdigit())
-    if digits:
-        return f"spk_{int(digits)}"
-    # Accept simple integer-like strings
-    if s.isdigit():
-        return f"spk_{int(s)}"
-    return s.lower()
-
-def extract_majority_word_speaker(words: Any) -> Optional[str]:
-    if not isinstance(words, list) or not words:
-        return None
-    speakers: List[str] = []
-    for w in words:
-        if not isinstance(w, dict):
-            continue
-        raw = None
-        for k in WORD_SPEAKER_KEYS:
-            if k in w:
-                raw = w[k]
-                break
-        sp = _norm_spk(raw)
-        if sp:
-            speakers.append(sp)
-    if not speakers:
-        return None
-    counts = Counter(speakers)
-    winner, _ = counts.most_common(1)[0]
-    return winner
-
-def extract_sentence_speaker(sentence: Dict[str, Any]) -> Tuple[Optional[str], str]:
-    """
-    Attempt speaker extraction from sentence-level fields first, then word-level majority.
-    Returns (speaker_label, source_tag)
-    source_tag: 'sentence', 'words', 'fake', or 'none'
-    """
-    for key in ("speaker", "speaker_id", "spk", "spk_id"):
-        raw = sentence.get(key)
-        sp = _norm_spk(raw)
-        if sp:
-            return sp, "sentence"
-
-    words = sentence.get("words") or sentence.get("word") or sentence.get("tokens") or sentence.get("Tokens")
-    sp_words = extract_majority_word_speaker(words)
-    if sp_words:
-        return sp_words, "words"
-    return None, "none"
-
-# -------------------- AWS-Shaped Payload Construction --------------------
+# --- AWS-shaped payload builder ---
 def build_aws_payload(
     *,
     text: str,
@@ -136,16 +64,10 @@ def build_aws_payload(
     items = []
     if speaker:
         items.append({"Type": "pronunciation", "Speaker": speaker})
-
     result_obj: Dict[str, Any] = {
         "ResultId": result_id,
         "IsPartial": is_partial,
-        "Alternatives": [
-            {
-                "Transcript": text,
-                "Items": items,
-            }
-        ],
+        "Alternatives": [{"Transcript": text, "Items": items}],
         "LanguageCode": language_code,
     }
     if speaker:
@@ -154,7 +76,6 @@ def build_aws_payload(
         result_obj["StartTimeMs"] = start_ms
     if end_ms is not None:
         result_obj["EndTimeMs"] = end_ms
-
     payload: Dict[str, Any] = {
         "Transcript": {"Results": [result_obj]},
         "DisplayText": text,
@@ -165,27 +86,19 @@ def build_aws_payload(
         payload["_debug"] = debug
     return payload
 
-# -------------------- Callback --------------------
+# --- Callback without diarization ---
 class ParaformerCallback(RecognitionCallback):
     """
-    Translate DashScope events (RecognitionResult or raw JSON) into AWS-like streaming payloads.
-    Handles:
-      - Unique result IDs
-      - Partial vs final distinction
-      - Language mapping
-      - Speaker diarization (real or fake fallback)
-      - Optional translation & entity extraction
-      - Timing based on SDK's begin_time / end_time fields (preferred) else wall-clock
+    Streams Alibaba recognition events into an asyncio.Queue as AWS-shaped payloads.
+    Since the model does not support speaker diarization, we assign placeholder
+    speaker labels only to FINAL sentences: sentence_1, sentence_2, ...
     """
-
     def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
         self.loop = loop
         self.queue = queue
         self.session_start_monotonic = time.monotonic()
         self.final_counter = 0
         self.current_partial_id: Optional[str] = None
-        self.last_final_speaker: Optional[str] = None
-        self.fake_turn_state: List[str] = []  # maintain encountered speakers if fake diarization engaged
 
     def _emit(self, data: Dict[str, Any]) -> None:
         self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
@@ -204,58 +117,34 @@ class ParaformerCallback(RecognitionCallback):
         logger.info("[Alibaba] Recognition completed")
         self._emit({"_complete": True})
 
-    # Utility for fallback timing if begin_time is missing
     def _rel_ms(self) -> int:
         return int((time.monotonic() - self.session_start_monotonic) * 1000)
 
-    def _assign_fake_speaker(self) -> str:
-        """
-        Simple turn-taking heuristic:
-        - First speaker => spk_0
-        - Next distinct turn => spk_1
-        - If >2 required, cycle spk_2, spk_3 ...
-        """
-        if not self.fake_turn_state:
-            self.fake_turn_state.append("spk_0")
-            return "spk_0"
-        if len(self.fake_turn_state) == 1:
-            self.fake_turn_state.append("spk_1")
-            return "spk_1"
-        # Cycle if more needed
-        next_index = len(self.fake_turn_state)
-        spk_label = f"spk_{next_index % MAX_FAKE_SPEAKERS}"
-        self.fake_turn_state.append(spk_label)
-        return spk_label
-
-    def _parse_raw_json(self, raw_str: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], bool]]:
+    def _parse_raw_json(self, raw_str: str) -> Optional[Dict[str, Any]]:
         try:
             obj = json.loads(raw_str)
         except Exception:
             return None
-        header = obj.get("header", {}) or {}
-        payload = obj.get("payload", {}) or {}
+        header = obj.get("header") or {}
+        payload = obj.get("payload") or {}
         name = header.get("name")
-        if name == "TranscriptionResultChanged":
-            is_final = False
-        elif name == "SentenceEnd":
-            is_final = True
-        else:
+        if name not in ("TranscriptionResultChanged", "SentenceEnd"):
             return None
-        return header, payload, is_final
+        payload["_is_final_name"] = (name == "SentenceEnd")
+        return payload
 
     def on_event(self, message: Any):
         try:
-            # Normalize into "sentence" dict and final flag.
             sentence: Dict[str, Any] = {}
             is_final = False
-            raw_debug: Dict[str, Any] = {}
+            dbg: Dict[str, Any] = {}
+
             if isinstance(message, RecognitionResult):
-                # SDK object
                 sent = message.get_sentence()
                 if not isinstance(sent, dict):
                     return
                 sentence = sent
-                raw_debug["raw_sentence_keys"] = list(sent.keys())
+                dbg["raw_sentence_keys"] = list(sent.keys())
                 try:
                     is_final = message.is_sentence_end(sent)
                 except Exception:
@@ -264,10 +153,9 @@ class ParaformerCallback(RecognitionCallback):
                 parsed = self._parse_raw_json(message)
                 if not parsed:
                     return
-                header, payload, is_final = parsed
-                sentence = payload
-                raw_debug["raw_header"] = header
-                raw_debug["raw_payload_keys"] = list(payload.keys())
+                sentence = parsed
+                is_final = bool(sentence.get("_is_final_name"))
+                dbg["raw_payload_keys"] = [k for k in sentence.keys() if k != "_is_final_name"]
             else:
                 return
 
@@ -275,7 +163,7 @@ class ParaformerCallback(RecognitionCallback):
             if not text:
                 return
 
-            # Times (prefer SDK begin_time / end_time)
+            # Timing
             begin_time_raw = sentence.get("begin_time")
             end_time_raw = sentence.get("end_time")
             try:
@@ -291,32 +179,21 @@ class ParaformerCallback(RecognitionCallback):
             lang_raw = sentence.get("language") or sentence.get("lang") or sentence.get("language_code")
             language_code = map_lang_to_ui(lang_raw, text)
 
-            # Speaker extraction
-            speaker_label, source_tag = extract_sentence_speaker(sentence)
-
-            # Fake diarization fallback if absent
-            if speaker_label is None and is_final and FAKE_DIARIZATION:
-                speaker_label = self._assign_fake_speaker()
-                source_tag = "fake"
-
-            # Maintain last_final_speaker (could assist other heuristics later)
-            if is_final and speaker_label:
-                self.last_final_speaker = speaker_label
+            # Placeholder speaker only for finalized sentences
+            speaker_label: Optional[str] = None
+            if is_final:
+                self.final_counter += 1
+                speaker_label = f"sentence_{self.final_counter}"
 
             # Unique IDs
             if is_final:
-                unique_suffix = uuid.uuid4().hex[:8]
-                if sentence_id is not None:
-                    result_id = f"alibaba-seg-{sentence_id}-{unique_suffix}"
-                else:
-                    result_id = f"alibaba-seg-{self.final_counter}-{unique_suffix}"
-                self.final_counter += 1
+                rid = f"alibaba-seg-{sentence_id if sentence_id is not None else self.final_counter}-{uuid.uuid4().hex[:8]}"
                 self.current_partial_id = None
             else:
                 if self.current_partial_id is None:
                     base = sentence_id if sentence_id is not None else self.final_counter
                     self.current_partial_id = f"alibaba-temp-{base}"
-                result_id = self.current_partial_id
+                rid = self.current_partial_id
 
             translated_text: Optional[str] = None
             entities: Optional[List[dict]] = None
@@ -324,44 +201,38 @@ class ParaformerCallback(RecognitionCallback):
                 if DO_TRANSLATE and nlp and not language_code.startswith("en"):
                     translated_text = nlp.to_english(text, language_code)
                 if DO_ENTITIES and nlp:
-                    analysis_text = translated_text or text
-                    entities = nlp.detect_entities(analysis_text)
+                    analysis = translated_text or text
+                    entities = nlp.detect_entities(analysis)
 
             if DBG:
-                raw_debug.update(
-                    {
-                        "sentence_id": sentence_id,
-                        "is_final": is_final,
-                        "speaker_extracted": speaker_label,
-                        "speaker_source": source_tag,
-                        "language_raw": lang_raw,
-                        "language_final": language_code,
-                        "begin_time": begin_time_raw,
-                        "end_time": end_time_raw,
-                        "result_id": result_id,
-                        "final_counter": self.final_counter,
-                        "fake_diarization": FAKE_DIARIZATION,
-                    }
-                )
+                dbg.update({
+                    "sentence_id": sentence_id,
+                    "is_final": is_final,
+                    "placeholder_speaker": speaker_label,
+                    "language_raw": lang_raw,
+                    "language_final": language_code,
+                    "result_id": rid,
+                    "final_counter": self.final_counter,
+                })
 
             payload = build_aws_payload(
                 text=text,
                 is_partial=not is_final,
-                result_id=result_id,
+                result_id=rid,
                 speaker=speaker_label,
                 language_code=language_code,
                 start_ms=start_ms,
                 end_ms=end_ms,
                 translated_text=translated_text,
                 entities=entities,
-                debug=raw_debug if DBG else None,
+                debug=dbg if DBG else None,
             )
             self._emit(payload)
 
         except Exception as exc:
             logger.exception("Error in on_event: %s", exc)
 
-# -------------------- WebSocket Endpoint --------------------
+# --- WebSocket endpoint ---
 @router.websocket("/alibaba")
 async def transcribe_alibaba(websocket: WebSocket):
     await websocket.accept()
@@ -401,7 +272,6 @@ async def transcribe_alibaba(websocket: WebSocket):
             while True:
                 data = await websocket.receive_bytes()
                 if not data:
-                    # zero-length frame signals end
                     try:
                         if recognizer:
                             recognizer.send_end_flag()
@@ -428,41 +298,20 @@ async def transcribe_alibaba(websocket: WebSocket):
             logger.error("receive_audio error: %s", e)
 
     try:
-        # Use correct diarization parameter name speaker_count (newer SDK)
-        try:
-            recognizer = Recognition(
-                model="paraformer-realtime-v2",
-                format="pcm",
-                sample_rate=16000,
-                diarization_enabled=True,
-                speaker_count=SPEAKER_COUNT,
-                language_hints=["en", "yue", "zh"],
-                callback=callback,
-                semantic_punctuation_enabled=False,
-                punctuation_prediction_enabled=True,
-                inverse_text_normalization_enabled=True,
-            )
-        except TypeError:
-            # Fallback if SDK doesn't support speaker_count
-            logger.warning("DashScope SDK missing speaker_count parameter; continuing without it.")
-            recognizer = Recognition(
-                model="paraformer-realtime-v2",
-                format="pcm",
-                sample_rate=16000,
-                diarization_enabled=True,
-                language_hints=["en", "yue", "zh"],
-                callback=callback,
-                semantic_punctuation_enabled=False,
-                punctuation_prediction_enabled=True,
-                inverse_text_normalization_enabled=True,
-            )
-
-        recognizer.start()
-        logger.info(
-            "DashScope recognizer started (diarization_enabled=True, speaker_count_hint=%s, fake_diarization=%s)",
-            SPEAKER_COUNT,
-            FAKE_DIARIZATION,
+        recognizer = Recognition(
+            model="paraformer-realtime-v2",
+            format="pcm",
+            sample_rate=16000,
+            # diarization removed – model unsupported
+            diarization_enabled=False,
+            language_hints=["en", "yue", "zh"],
+            callback=callback,
+            semantic_punctuation_enabled=False,
+            punctuation_prediction_enabled=True,
+            inverse_text_normalization_enabled=True,
         )
+        recognizer.start()
+        logger.info("DashScope recognizer started (placeholder speakers)")
 
         sender_task = asyncio.create_task(forward_events())
         audio_task = asyncio.create_task(receive_audio())
