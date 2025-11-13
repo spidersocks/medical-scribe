@@ -179,6 +179,10 @@ class ParaformerCallback(RecognitionCallback):
             lang_raw = sentence.get("language") or sentence.get("lang") or sentence.get("language_code")
             language_code = map_lang_to_ui(lang_raw, text)
 
+            # --- NEW: Convert to Traditional Chinese if applicable ---
+            if is_final and language_code.startswith("zh") and nlp:
+                text = nlp.to_traditional_chinese(text)
+
             # Placeholder speaker only for finalized sentences
             speaker_label: Optional[str] = None
             if is_final:

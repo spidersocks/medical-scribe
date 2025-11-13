@@ -32,6 +32,23 @@ def to_english(text: str, detected_language: Optional[str]) -> str:
     except Exception:
         return text
 
+def to_traditional_chinese(text: str) -> str:
+    """
+    Translates Simplified Chinese text to Traditional Chinese.
+    """
+    if not text:
+        return ""
+    try:
+        res = get_translate_client().translate_text(
+            Text=text,
+            SourceLanguageCode="zh",
+            TargetLanguageCode="zh-TW",
+        )
+        return res.get("TranslatedText", text)
+    except Exception:
+        # Fallback to original text on any error
+        return text
+
 
 def detect_entities(text_en: str) -> List[Dict[str, Any]]:
     if not text_en:

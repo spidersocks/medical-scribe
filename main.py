@@ -662,6 +662,7 @@ def _sanitize_note_values(note: Dict[str, Any]) -> Dict[str, Any]:
     - Coerce placeholder strings to 'None'
     - If a list contains a single object whose 'text' is placeholder, set the section to 'None'
     - If a list is empty, set to 'None'
+    - Enforce {"text": "..."} structure for items in a list.
     """
     if not isinstance(note, dict):
         return note
@@ -674,26 +675,42 @@ def _sanitize_note_values(note: Dict[str, Any]) -> Dict[str, Any]:
 
         # List case
         if isinstance(v, list):
-            if len(v) == 0:
+            if not v:
                 note[k] = "None"
                 continue
-            if len(v) == 1 and isinstance(v[0], dict):
-                inner_text = str(v[0].get("text", "")).strip().lower()
-                if inner_text in _PLACEHOLDER_VALUES or (inner_text.startswith("none") and len(inner_text) <= 6):
+            
+            # Check if the list contains only a single placeholder entry
+            if len(v) == 1:
+                item = v[0]
+                text_val = ""
+                if isinstance(item, dict):
+                    text_val = str(item.get("text", "")).strip().lower()
+                elif isinstance(item, str):
+                    text_val = item.strip().lower()
+                
+                if text_val in _PLACEHOLDER_VALUES or (text_val.startswith("none") and len(text_val) <= 6):
                     note[k] = "None"
                     continue
-            # Also sanitize each {"text": "..."} element if needed
+
+            # Sanitize each item in the list to enforce {"text": "..."}
             sanitized_list = []
             for item in v:
-                if isinstance(item, dict) and "text" in item:
-                    coerced = _coerce_placeholder_to_none(item["text"])
-                    if coerced == "None":
-                        sanitized_list.append({"text": "None"})
-                    else:
-                        sanitized_list.append({"text": item["text"]})
-                else:
-                    sanitized_list.append(item)
-            note[k] = sanitized_list
+                text_to_add = None
+                if isinstance(item, dict):
+                    text_to_add = item.get("text")
+                elif isinstance(item, str):
+                    text_to_add = item
+                
+                if text_to_add is not None:
+                    coerced = _coerce_placeholder_to_none(text_to_add)
+                    # Don't add items that are just placeholders, unless it's the only one (handled above)
+                    if coerced != "None" or len(v) == 1:
+                         sanitized_list.append({"text": str(coerced)})
+            
+            if not sanitized_list:
+                note[k] = "None"
+            else:
+                note[k] = sanitized_list
             continue
 
         # Dict sub-sections (e.g., Physical Examination object) – shallow sanitize fields
