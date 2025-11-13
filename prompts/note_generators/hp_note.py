@@ -80,7 +80,7 @@ SPECIFIC_INSTRUCTIONS = """
 - History of Present Illness: Chronologic narrative strictly based on transcript; include pertinent positives/negatives explicitly stated. If insufficient or not discussed, set to "None".
 - Past Medical History / Past Surgical History / Family History / Social History / Medications / Allergies: Include only items explicitly mentioned. If a section was not discussed, set it to "None".
 - Review of Systems: Include only systems actually reviewed and stated. If not discussed, set "Review of Systems" to "None".
-- Physical Examination: Include only systems/findings explicitly examined and stated. If not discussed, set "Physical Examination" to "None".
+- Physical Examination: Include only systems/findings explicitly examined and stated. If not discussed, set to "None".
 - Assessment and Plan: Only problems/plan items explicitly stated by a clinician. If none discussed, set to "None".
 - Do not invent or infer content. Any required section not discussed must be "None".
 
@@ -100,6 +100,6 @@ def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> st
 {SPECIFIC_INSTRUCTIONS}
 {EXAMPLES}
 
-**YOUR TASK:**
+**TRANSCRIPT AND TASK:**
 Generate a complete and accurate H&P note from the following transcript. Be comprehensive and systematic.
 """

@@ -48,6 +48,6 @@ def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> st
 {SPECIFIC_INSTRUCTIONS}
 {EXAMPLES}
 
-**YOUR TASK:**
-Now, using all the principles and the "Gold Standard" examples above, generate a complete and accurate JSON note from the following transcript.
+**TRANSCRIPT AND TASK:**
+Using all the principles and the "Gold Standard" examples above, generate a complete and accurate JSON note from the following transcript.
 """

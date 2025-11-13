@@ -30,6 +30,8 @@ from services import template_service
 from config import settings
 from prompts.base import BUILTIN_NOTE_KEYS
 
+# --- Force DEBUG logging level ---
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # API router and services
@@ -336,43 +338,37 @@ def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> 
 # ---- Bedrock invocation + robust JSON extraction helpers ----
 def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:
     """
-    Attempt to extract the main JSON substring from model output; returns (substring, error_message)
+    Bulletproof JSON finder. It looks for the last top-level JSON object in the string,
+    ignoring any conversational text or markdown fences.
     """
     if not text:
         return "", "Empty model output"
 
-    start_index = text.find("{")
-    if start_index == -1:
+    # Find the start of the last JSON object
+    last_brace_index = text.rfind('{')
+    if last_brace_index == -1:
         return "", "Could not find JSON object in model output."
 
-    json_substring = text[start_index:].strip()
-
-    # strip fenced codeblock markers if present
-    if json_substring.startswith("```"):
-        lines = json_substring.split("\n")
-        # remove triple-backticks lines
-        if lines and lines[-1].strip() == "```":
-            json_substring = "\n".join(lines[1:-1])
-        else:
-            json_substring = "\n".join(lines[1:])
-
-    # trim to matching braces if possible
+    # Find the matching closing brace
     brace_level = 0
-    last_brace_index = -1
-    for idx, ch in enumerate(json_substring):
-        if ch == "{":
+    first_brace_found = False
+    end_brace_index = -1
+    for i in range(last_brace_index, len(text)):
+        char = text[i]
+        if char == '{':
+            if not first_brace_found:
+                first_brace_found = True
             brace_level += 1
-        elif ch == "}":
+        elif char == '}':
             brace_level -= 1
-            if brace_level == 0:
-                last_brace_index = idx
+            if first_brace_found and brace_level == 0:
+                end_brace_index = i + 1
                 break
-    if last_brace_index != -1:
-        json_substring = json_substring[: last_brace_index + 1]
-    elif not json_substring.endswith("}"):
-        json_substring += "}"
+    
+    if end_brace_index == -1:
+        return "", "Could not find matching closing brace for JSON object."
 
-    return json_substring, None
+    return text[last_brace_index:end_brace_index], None
 
 
 def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
@@ -390,10 +386,10 @@ def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
 def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens: int = 4096, temperature: float = 0.1) -> Dict[str, Any]:
     """
     Invokes Bedrock model with composed prompt and returns parsed JSON object.
-    Adds helpful logging of the prompt and model output (truncated) for debugging.
+    Simplifies prompt structure to avoid conversational-style responses.
     """
-    composed_prompt = f"System: {system_prompt}\n\nUser: {user_payload}\n\nAssistant:"
-    # Log truncated prompt for debugging (avoid logging full patient PHI in production)
+    # Combine the system prompt and the user payload directly.
+    composed_prompt = f"{system_prompt}\n\n{user_payload}"
     try:
         safe_prompt = composed_prompt.replace("\n", "\\n")
         logger.debug("COMPOSED PROMPT (truncated 4000 chars): %s", safe_prompt[:4000])
@@ -409,50 +405,31 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
             accept="application/json",
             contentType="application/json",
         )
-    except Exception as exc:
-        raise ValueError(f"Bedrock invocation failed: {exc}") from exc
-
-    try:
         response_body = json.loads(response.get("body").read())
-        model_output = response_body.get("outputs", [{}])[0].get("text", "")
-        stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
     except Exception as exc:
-        raise ValueError(f"Failed to read Bedrock response: {exc}") from exc
+        raise ValueError(f"Bedrock invocation or response body parsing failed: {exc}") from exc
 
-    # Log model output truncated for debugging
-    # DEBUG CHANGE: Log the *full* model output for temporary debugging.
-    try:
-        logger.debug("MODEL OUTPUT (full): %s", model_output)
-    except Exception:
-        logger.debug("MODEL OUTPUT (could not stringify)")
+    # Handle cases where model output is nested, e.g., {"text": "{...}"}
+    model_output = response_body.get("outputs", [{}])[0].get("text", "")
+    stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
+
+    logger.debug("MODEL OUTPUT (full): %s", model_output)
 
     json_substring, find_err = _find_json_substring(model_output)
     if find_err:
-        # If we couldn't even find a JSON start, include snippet in error to aid debugging
         raise ValueError(find_err + f" Raw model output (first 1000 chars): {model_output[:1000]}")
 
     try:
         parsed = _repair_and_parse_json(json_substring)
-        logger.info("Successfully parsed JSON from model output with %d top-level keys.", len(parsed))
+        logger.info("Successfully parsed JSON substring from model output with %d keys.", len(parsed))
         return parsed
     except Exception as exc:
-        # attempt a repair and include the model_output snippet in the error for debugging
-        try:
-            repaired = json_substring
-            if 'text:' in repaired:
-                repaired = re.sub(r'\{"text:\s*"', '{"text": "', repaired)
-            repaired = re.sub(r'"([^"]+):\s*(["\[\{])', r'"\1": \2', repaired)
-            parsed = json.loads(repaired)
-            logger.info("Parsed JSON after secondary repair.")
-            return parsed
-        except Exception as repair_error:
-            # Provide rich debugging context in the raised error
-            error_msg = (
-                "Failed to parse JSON from final note even after repair. "
-                f"Stop Reason: {stop_reason}. Initial parse error: {exc}. Repair error: {repair_error}. "
-                f"Full model output (first 2000 chars): '{model_output[:2000]}'"
-            )
-            raise ValueError(error_msg) from repair_error
+        error_msg = (
+            "Failed to parse JSON from final note even after repair. "
+            f"Stop Reason: {stop_reason}. Initial parse error: {exc}. "
+            f"Full model output (first 2000 chars): '{model_output[:2000]}'"
+        )
+        raise ValueError(error_msg) from exc
 
 
 def generate_note_from_system_prompt(
@@ -466,8 +443,7 @@ def generate_note_from_system_prompt(
 ) -> Dict[str, Any]:
     """
     High-level wrapper to prepare user payload and call Bedrock + parsing.
-    Adds patient_info and encounter metadata to the user payload so the LLM can
-    reference them explicitly (in addition to any patient context embedded in the system prompt).
+    The payload is now a simple JSON string, not nested under a 'User:' block.
     """
     user_payload_obj = {
         "full_transcript": full_transcript,
@@ -1000,7 +976,9 @@ def register_routes(app: FastAPI) -> None:
 
     @app.post("/generate-final-note")
     async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
-        full_transcript = (payload.full_transcript or "").strip()
+        # Clean speaker labels (e.g., "[sentence_1]: ...") from the transcript
+        full_transcript = re.sub(r"\[[^\]]+\]:\s*", "", (payload.full_transcript or "")).strip()
+
         if not full_transcript:
             raise HTTPException(status_code=400, detail="Received an empty transcript.")
 

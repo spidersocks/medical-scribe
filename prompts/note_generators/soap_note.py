@@ -36,6 +36,6 @@ def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> st
 {SPECIFIC_INSTRUCTIONS}
 {EXAMPLES}
 
-**YOUR TASK:**
+**TRANSCRIPT AND TASK:**
 Generate a complete and accurate SOAP note from the following transcript.
 """

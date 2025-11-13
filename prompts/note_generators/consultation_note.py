@@ -1,4 +1,3 @@
-# prompts/note_generators/consultation_note.py
 from ..base import CORE_PRINCIPLES, build_patient_context
 
 NOTE_TYPE = "Consultation Note"
@@ -107,6 +106,6 @@ def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> st
 {SPECIFIC_INSTRUCTIONS}
 {EXAMPLES}
 
-**YOUR TASK:**
+**TRANSCRIPT AND TASK:**
 Generate a complete and accurate consultation note from the following transcript. Focus on answering the specific consultation question with clear, actionable recommendations.
 """
