@@ -1,4 +1,3 @@
-# prompts/note_generators/standard_note.py
 from ..base import CORE_PRINCIPLES, build_patient_context
 
 NOTE_TYPE = "Standard Clinical Note"
@@ -31,13 +30,13 @@ EXAMPLES = """
 
 SPECIFIC_INSTRUCTIONS = """
 **SPECIFIC INSTRUCTIONS FOR THIS NOTE TYPE:**
-- Begin HPI with "The patient is a [age]-year-old [gender]..." if demographics are known
-- If patient name is provided in patient information, you may include it naturally in the HPI
-- Pertinent Negatives must be a JSON array of objects with "text" keys
-- Past Medical History should include all conditions mentioned, even minor ones
-- If no past medical history is discussed, use "No past medical history discussed" rather than "None"
-- Medications are pre-existing home medications only
-- Assessment and Plan should group related items under single problem numbers
+- Chief Complaint: JSON array of objects with "text" keys; include only complaints explicitly stated. If none discussed, set "Chief Complaint" to "None".
+- History of Present Illness: Narrative strictly reflecting facts from the transcript. Start with “The patient is a [age]-year-old [sex]…” if known. No added interpretation.
+- Pertinent Negatives: JSON array of {"text": "..."} items stated in the transcript (e.g., “Denies chest pain”). If none discussed, set to "None".
+- Past Medical History: Only conditions explicitly mentioned. If none discussed, set to "None".
+- Medications: Home medications explicitly mentioned. If none discussed, set to "None".
+- Assessment and Plan: Only plans explicitly stated by a clinician in the transcript. If none discussed, set to "None".
+- Do not invent, infer, or recommend anything not said. If any section was not discussed, set its value to the exact string "None".
 """
 
 def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> str:

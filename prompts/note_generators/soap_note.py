@@ -20,11 +20,11 @@ EXAMPLES = """
 
 SPECIFIC_INSTRUCTIONS = """
 **SPECIFIC INSTRUCTIONS FOR SOAP NOTES:**
-- **Subjective**: Narrative paragraph with patient's complaints, history, and relevant review of systems
-- **Objective**: Structured data including vital signs and physical exam findings (use "Not documented" if not in transcript)
-- **Assessment**: Array of diagnostic impressions, each as an object with "text" key
-- **Plan**: Array of action items, each as an object with "text" key
-- Keep it concise and organized by SOAP structure
+- Subjective: Narrative of the patient’s reported symptoms/history and clinician-elicited details explicitly stated. If not discussed, set "Subjective" to "None".
+- Objective: Include only vital signs and exam findings explicitly stated. If not discussed, set "Objective" to "None".
+- Assessment: Diagnostic impressions only if explicitly stated by a clinician. If none discussed, set "Assessment" to "None".
+- Plan: Action items only if explicitly stated by a clinician. If none discussed, set "Plan" to "None".
+- No unsolicited advice, tests, or treatments. If a section was not discussed, set it to "None".
 """
 
 def generate_prompt(patient_info: dict = None, encounter_time: str = None) -> str:

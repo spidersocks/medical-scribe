@@ -76,13 +76,14 @@ EXAMPLES = """
 
 SPECIFIC_INSTRUCTIONS = """
 **SPECIFIC INSTRUCTIONS FOR CONSULTATION NOTES:**
-- **Consultation Request**: State clearly who requested the consult and why (the specific question to be answered)
-- **History of Present Illness**: Focused on the consultation question. Start with a brief "Thank you for consulting me on..." statement
-- **Past Medical History**: Include relevant history, not necessarily comprehensive
-- **Pertinent Physical Examination**: Focused exam relevant to the consultation question, not comprehensive head-to-toe
-- **Diagnostic Studies Reviewed**: List all relevant labs, imaging, studies reviewed with key findings
-- **Assessment**: Your consultant interpretation and clinical reasoning
-- **Recommendations**: Numbered, specific, actionable recommendations. This is the most important section - be clear and thorough
+- Consultation Request: State who requested the consult and why, exactly as stated. If not provided, set to "None".
+- History of Present Illness: Focused on the consultation question; include only what was said.
+- Past Medical History / Past Surgical History / Family History / Social History / Current Medications / Allergies: Include only items explicitly mentioned. If a section was not discussed, set it to "None".
+- Pertinent Physical Examination: Include only exam findings explicitly stated. If not discussed, set to "None".
+- Diagnostic Studies Reviewed: List only studies and findings explicitly stated. If not discussed, set to "None".
+- Assessment: Summarize only the consultant’s assessment explicitly stated. If not discussed, set to "None".
+- Recommendations: Include only recommendations explicitly stated by the consulting clinician. If none were stated, set "Recommendations" to "None".
+- Do not add availability/follow-up language or additional suggestions unless explicitly stated. No invented recommendations.
 
 **TONE:**
 - Professional and collegial

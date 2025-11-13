@@ -76,17 +76,13 @@ EXAMPLES = """
 
 SPECIFIC_INSTRUCTIONS = """
 **SPECIFIC INSTRUCTIONS FOR H&P NOTES:**
-- **Chief Complaint**: Brief statement of why the patient is being admitted, in patient's own words when possible
-- **History of Present Illness**: Detailed narrative of the current illness, chronological progression, pertinent positives and negatives
-- **Past Medical History**: All chronic conditions, past diagnoses - be comprehensive. If none discussed, write "None discussed"
-- **Past Surgical History**: All prior surgeries with approximate dates if mentioned. If none, write "None"
-- **Family History**: Relevant family medical history, particularly conditions that run in families. If none discussed, write "None discussed"
-- **Social History**: Smoking, alcohol, drugs, occupation, living situation, functional status
-- **Medications**: All home medications with doses and frequencies. If none, write "None"
-- **Allergies**: Include reaction type (e.g., rash, anaphylaxis). If none mentioned, write "No known drug allergies"
-- **Review of Systems**: Comprehensive review, organized by system. Only include systems that were actually reviewed or are relevant to the chief complaint. Omit systems that are clearly not applicable.
-- **Physical Examination**: Systematic exam organized by body system. Only include body systems that were actually examined. Omit irrelevant systems entirely rather than marking "Not applicable"
-- **Assessment and Plan**: Problem-based approach with numbered problems, including working diagnosis and detailed plan for each
+- Chief Complaint: JSON array of {"text": "..."} with the patient’s stated reason for visit if present; otherwise "None".
+- History of Present Illness: Chronologic narrative strictly based on transcript; include pertinent positives/negatives explicitly stated. If insufficient or not discussed, set to "None".
+- Past Medical History / Past Surgical History / Family History / Social History / Medications / Allergies: Include only items explicitly mentioned. If a section was not discussed, set it to "None".
+- Review of Systems: Include only systems actually reviewed and stated. If not discussed, set "Review of Systems" to "None".
+- Physical Examination: Include only systems/findings explicitly examined and stated. If not discussed, set "Physical Examination" to "None".
+- Assessment and Plan: Only problems/plan items explicitly stated by a clinician. If none discussed, set to "None".
+- Do not invent or infer content. Any required section not discussed must be "None".
 
 **FORMATTING RULES:**
 - ROS and Physical Exam should ONLY include systems that are relevant or were actually examined
