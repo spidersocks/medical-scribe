@@ -722,122 +722,125 @@ def register_routes(app: FastAPI) -> None:
         finally:
             logger.info("Browser session ended.")
 
-    @app.post("/generate-final-note")
-    async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
-        full_transcript = (payload.full_transcript or "").strip()
-        if not full_transcript:
-            raise HTTPException(status_code=400, detail="Received an empty transcript.")
+        @app.post("/generate-final-note")
+        async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
+            full_transcript = (payload.full_transcript or "").strip()
+            if not full_transcript:
+                raise HTTPException(status_code=400, detail="Received an empty transcript.")
 
-        logger.info(
-            "Received transcript (%d chars) for note_type=%s template_id=%s",
-            len(full_transcript),
-            payload.note_type,
-            getattr(payload, "template_id", None),
-        )
-
-        patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
-
-        try:
-            # Translate to English if needed (chunked safely)
-            if _has_cjk(full_transcript):
-                logger.info("Detected CJK characters. Translating to English with chunking.")
-                english_transcript = _translate_large_text("zh", "en", full_transcript)
-                logger.info("Translation complete. English transcript length=%d.", len(english_transcript))
-            else:
-                english_transcript = full_transcript
-
-            # Comprehend Medical entity detection (then compact for prompt)
-            entities_response = get_comprehend_client().detect_entities_v2(Text=english_transcript)
-            entities = entities_response.get("Entities", []) or []
-            logger.info("Comprehend Medical returned %d entities.", len(entities))
-            ents_compact = _filter_and_compact_entities_for_llm(entities)
-
-            # --- NEW: Medical detail validation ---
-            MIN_TRANSCRIPT_LENGTH = 50
-
-            if len(english_transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Transcript too short—contains insufficient medical detail for note generation."
-                )
-
-            medical_ents = [e for e in ents_compact.get("ents", []) 
-                            if e["c"] in ("MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY")]
-            if not medical_ents:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Transcript contains insufficient medical detail for note generation."
-                )
-
-            # Mask PHI entities in the transcript before sending to the LLM
-            english_transcript_masked = _mask_phi_entities(english_transcript, entities)
-
-            # Determine base system prompt for the requested note type
-            try:
-                prompt_module = get_prompt_generator(payload.note_type)
-                base_system_prompt = prompt_module.generate_prompt(patient_info_dict)
-            except Exception as e:
-                logger.warning("Unknown note type '%s': %s. Falling back to standard prompt.", payload.note_type, e)
-                prompt_module = get_prompt_generator("standard")
-                base_system_prompt = prompt_module.generate_prompt(patient_info_dict)
-
-            # Optionally augment with template instructions when template_id is provided
-            final_system_prompt = base_system_prompt
-            temperature = 0.1  # default temperature
-            if getattr(payload, "template_id", None):
-                if not template_service:
-                    raise HTTPException(status_code=400, detail="Template support not available on server.")
-                try:
-                    template_obj = await template_service.get(str(payload.template_id))
-                    template_dict = template_obj.model_dump()
-                    template_instructions = _prepare_template_instructions(template_dict)
-
-                    # Place template instructions after the base prompt and add a strict header to increase compliance
-                    final_system_prompt = (
-                        f"{base_system_prompt}\n\n"
-                        "TEMPLATE INSTRUCTIONS (FOLLOW THESE EXACTLY):\n"
-                        f"{template_instructions}\n\n"
-                        "STRICT REQUIREMENT: Return ONLY a single valid JSON object that matches the template keys exactly. Do not include any extra text or explanation."
-                    )
-
-                    # Lower temperature for more deterministic, template-compliant output
-                    temperature = 0.0
-
-                    logger.info("Using template %s to augment system prompt.", template_dict.get("id"))
-                except Exception as exc:
-                    logger.exception("Failed to fetch/prepare template: %s", exc)
-                    raise HTTPException(status_code=400, detail=f"Could not load template: {exc}") from exc
-
-            # Determine encounter_time to pass to the LLM:
-            # Prefer payload.encounter_time if provided, else leave None (frontend includes it when available)
-            encounter_time = getattr(payload, "encounter_time", None)
-            encounter_type = getattr(payload, "encounter_type", None)
-
-            # Generate note using composed system prompt and pass patient/encounter metadata
-            # Use the PHI-masked transcript for the LLM
-            final_note = generate_note_from_system_prompt(
-                final_system_prompt,
-                english_transcript_masked,
-                ents_compact,
-                patient_info=patient_info_dict,
-                encounter_time=encounter_time,
-                encounter_type=encounter_type,
-                temperature=temperature,
+            logger.info(
+                "Received transcript (%d chars) for note_type=%s template_id=%s",
+                len(full_transcript),
+                payload.note_type,
+                getattr(payload, "template_id", None),
             )
 
-            # Optional normalization for "standard"
-            if payload.note_type == "standard":
-                final_note = _normalize_assessment_plan(
-                    _normalize_empty_sections(_fix_pertinent_negatives(final_note))
+            patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
+
+            try:
+                # Translate to English if needed (chunked safely)
+                if _has_cjk(full_transcript):
+                    logger.info("Detected CJK characters. Translating to English with chunking.")
+                    english_transcript = _translate_large_text("zh", "en", full_transcript)
+                    logger.info("Translation complete. English transcript length=%d.", len(english_transcript))
+                else:
+                    english_transcript = full_transcript
+
+                # Comprehend Medical entity detection (then compact for prompt)
+                entities_response = get_comprehend_client().detect_entities_v2(Text=english_transcript)
+                entities = entities_response.get("Entities", []) or []
+                logger.info("Comprehend Medical returned %d entities.", len(entities))
+                ents_compact = _filter_and_compact_entities_for_llm(entities)
+
+                # Guardrail: ensure we have enough content before LLM
+                MIN_TRANSCRIPT_LENGTH = 50
+                if len(english_transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Transcript too short—contains insufficient medical detail for note generation."
+                    )
+
+                medical_ents = [e for e in ents_compact.get("ents", [])
+                                if e["c"] in ("MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY")]
+                if not medical_ents:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Transcript contains insufficient medical detail for note generation."
+                    )
+
+                # Mask PHI entities in the transcript before sending to the LLM
+                english_transcript_masked = _mask_phi_entities(english_transcript, entities)
+
+                # Prepare encounter metadata EARLY so we can pass it into the prompt generator
+                encounter_time = getattr(payload, "encounter_time", None)
+                encounter_type = getattr(payload, "encounter_type", None)
+
+                # Determine base system prompt for the requested note type
+                try:
+                    prompt_module = get_prompt_generator(payload.note_type)
+                    # IMPORTANT: pass encounter_time so it is human-readable via build_patient_context
+                    base_system_prompt = prompt_module.generate_prompt(patient_info_dict, encounter_time)
+                except Exception as e:
+                    logger.warning("Unknown note type '%s': %s. Falling back to standard prompt.", payload.note_type, e)
+                    prompt_module = get_prompt_generator("standard")
+                    base_system_prompt = prompt_module.generate_prompt(patient_info_dict, encounter_time)
+
+                # Optionally augment with template instructions when template_id is provided
+                final_system_prompt = base_system_prompt
+                temperature = 0.1  # default temperature
+                template_dict = None
+                if getattr(payload, "template_id", None):
+                    if not template_service:
+                        raise HTTPException(status_code=400, detail="Template support not available on server.")
+                    try:
+                        template_obj = await template_service.get(str(payload.template_id))
+                        template_dict = template_obj.model_dump()
+                        template_instructions = _prepare_template_instructions(template_dict)
+
+                        # Place template instructions after the base prompt and add a strict header to increase compliance
+                        final_system_prompt = (
+                            f"{base_system_prompt}\n\n"
+                            "TEMPLATE INSTRUCTIONS (FOLLOW THESE EXACTLY):\n"
+                            f"{template_instructions}\n\n"
+                            "STRICT REQUIREMENT: Return ONLY a single valid JSON object that matches the template keys exactly. Do not include any extra text or explanation."
+                        )
+
+                        # Lower temperature for more deterministic, template-compliant output
+                        temperature = 0.0
+
+                        logger.info("Using template %s to augment system prompt.", template_dict.get("id"))
+                    except Exception as exc:
+                        logger.exception("Failed to fetch/prepare template: %s", exc)
+                        raise HTTPException(status_code=400, detail=f"Could not load template: {exc}") from exc
+
+                # Generate note using composed system prompt and pass patient/encounter metadata
+                final_note = generate_note_from_system_prompt(
+                    final_system_prompt,
+                    english_transcript_masked,
+                    ents_compact,
+                    patient_info=patient_info_dict,
+                    encounter_time=encounter_time,
+                    encounter_type=encounter_type,
+                    temperature=temperature,
                 )
 
-            return {"notes": final_note}
-        except ValueError as exc:
-            logger.error("Note generation error: %s", exc)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.exception("Unexpected error during final note generation.")
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+                expected_keys = get_expected_keys(payload, template_dict)
+                if expected_keys:
+                    final_note = normalize_note_keys(final_note, expected_keys)
+
+                # Optional normalization for "standard"
+                if payload.note_type == "standard":
+                    final_note = _normalize_assessment_plan(
+                        _normalize_empty_sections(_fix_pertinent_negatives(final_note))
+                    )
+
+                return {"notes": final_note}
+            except ValueError as exc:
+                logger.error("Note generation error: %s", exc)
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("Unexpected error during final note generation.")
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/execute-command")
     async def execute_command(payload: CommandPayload) -> Dict[str, str]:

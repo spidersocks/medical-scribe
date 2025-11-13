@@ -4,13 +4,16 @@ from datetime import datetime, timezone
 def _format_encounter_time(encounter_time: str) -> str:
     """
     Convert an ISO 8601 timestamp (e.g., 2025-11-13T12:04:58.841Z) into a human-readable string.
+    Example: 'November 13, 2025 at 12:04 PM'
     Falls back to the original string on parse errors.
     """
     try:
         dt = datetime.fromisoformat(encounter_time.replace("Z", "+00:00"))
         dt_utc = dt.astimezone(timezone.utc)
-        # Example: "November 13, 2025 at 12:04 UTC"
-        return f"{dt_utc.strftime('%B %d, %Y at %H:%M')} UTC"
+        # Prefer 12-hour clock with AM/PM; remove leading zeros for day/hour on platforms without %-d/%-I
+        date_str = dt_utc.strftime("%B %d, %Y at %I:%M %p")
+        date_str = date_str.replace(" 0", " ")  # clean leading zeros (day/hour)
+        return f"{date_str}"
     except Exception:
         return encounter_time
 
