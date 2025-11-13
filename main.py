@@ -91,27 +91,29 @@ class CommandPayload(BaseModel):
     note_content: Dict[str, Any]
     command: str
 
-
-# ✅ Added helper for normalization before register_routes
 def normalize_note_keys(note, expected_keys):
     """
     Ensure all expected keys are present in the note.
-    If missing, set to "None". Remove unexpected keys unless it's error fallback.
+    Coerce placeholder / empty values to 'None'.
     """
-    # Accept error fallback if present
     if note == {"error": "insufficient_medical_information"}:
         return note
     fixed = {}
     for k in expected_keys:
         v = note.get(k)
-        if v in (None, "", [], {}, "Not documented", "No known drug allergies", "No past medical history discussed"):
+        # Coerce single-item list style like [{"text": "undefined"}]
+        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict):
+            candidate = v[0].get("text")
+            if isinstance(candidate, str) and candidate.strip().lower() in _PLACEHOLDER_VALUES:
+                v = "None"
+
+        if isinstance(v, str) and v.strip().lower() in _PLACEHOLDER_VALUES:
+            fixed[k] = "None"
+        elif v in (None, "", [], {}):
             fixed[k] = "None"
         else:
             fixed[k] = v
-    # Remove unexpected keys
-    extra = set(note.keys()) - set(expected_keys)
-    for k in extra:
-        pass  # optionally log
+    # Drop unexpected keys silently (or log if desired)
     return fixed
 
 
@@ -824,11 +826,15 @@ def register_routes(app: FastAPI) -> None:
                 temperature=temperature,
             )
 
+            # First pass: sanitize placeholders like 'undefined'
+            final_note = _sanitize_note_values(final_note)
+
+            # Then apply expected key normalization (fills missing with 'None')
             expected_keys = get_expected_keys(payload, template_dict)
             if expected_keys:
                 final_note = normalize_note_keys(final_note, expected_keys)
 
-            # Optional normalization for "standard"
+            # Existing standard-specific normalizations
             if payload.note_type == "standard":
                 final_note = _normalize_assessment_plan(
                     _normalize_empty_sections(_fix_pertinent_negatives(final_note))
@@ -1041,7 +1047,19 @@ def _fix_pertinent_negatives(note: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
     sections_to_check = ["Pertinent Negatives", "Past Medical History", "Medications"]
-    empty_markers = {"no pertinent negatives", "no past medical history", "not discussed", "none mentioned", "none"}
+    empty_markers = {
+        "no pertinent negatives",
+        "no past medical history",
+        "not discussed",
+        "none mentioned",
+        "none",
+        "n/a",
+        "na",
+        "not provided",
+        "undefined",
+        "null",
+        "empty"
+    }
 
     for section in sections_to_check:
         items = note.get(section)
@@ -1052,13 +1070,91 @@ def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
             value = items[0].get("text", "").strip().lstrip("-").lower()
 
-        if value in empty_markers:
+        if value in empty_markers or value == "":
             if note.get(section) != "None":
-                logger.info("Normalizing verbose empty section '%s' to 'None'.", section)
+                logger.info("Normalizing empty section '%s' to 'None'. Raw value='%s'", section, value)
                 note[section] = "None"
 
     return note
 
+# ---- NEW: Generic coercion & sanitization helpers ----
+_PLACEHOLDER_VALUES = {
+    "undefined",
+    "null",
+    "none",
+    "n/a",
+    "na",
+    "not provided",
+    "not discussed",
+    "not mentioned",
+    "empty",
+    "",
+}
+
+def _coerce_placeholder_to_none(val: Any) -> Any:
+    """
+    Convert various placeholder / empty sentinel strings to the literal 'None'.
+    Leaves structured objects/lists unless they themselves contain placeholder-only content.
+    """
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in _PLACEHOLDER_VALUES:
+            return "None"
+        # Catch short variants like "none." or "none," etc.
+        if v.startswith("none") and len(v) <= 6:
+            return "None"
+    return val
+
+
+def _sanitize_note_values(note: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Walk all top-level sections and:
+    - Coerce placeholder strings to 'None'
+    - If a list contains a single object whose 'text' is placeholder, set the section to 'None'
+    - If a list is empty, set to 'None'
+    """
+    for k, v in list(note.items()):
+        # Direct string case
+        if isinstance(v, str):
+            note[k] = _coerce_placeholder_to_none(v)
+            continue
+
+        # List case
+        if isinstance(v, list):
+            if len(v) == 0:
+                note[k] = "None"
+                continue
+            if len(v) == 1 and isinstance(v[0], dict):
+                inner_text = str(v[0].get("text", "")).strip().lower()
+                if inner_text in _PLACEHOLDER_VALUES or (inner_text.startswith("none") and len(inner_text) <= 6):
+                    note[k] = "None"
+                    continue
+            # Also sanitize each {"text": "..."} element if needed
+            sanitized_list = []
+            for item in v:
+                if isinstance(item, dict) and "text" in item:
+                    coerced = _coerce_placeholder_to_none(item["text"])
+                    if coerced == "None":
+                        # If any item becomes None we still keep structure, unless you prefer collapsing
+                        sanitized_list.append({"text": "None"})
+                    else:
+                        sanitized_list.append({"text": item["text"]})
+                else:
+                    sanitized_list.append(item)
+            note[k] = sanitized_list
+            continue
+
+        # Dict sub-sections (e.g., Physical Examination object) – recursively sanitize shallow fields
+        if isinstance(v, dict):
+            inner = {}
+            for ik, iv in v.items():
+                if isinstance(iv, str):
+                    inner[ik] = _coerce_placeholder_to_none(iv)
+                else:
+                    inner[ik] = iv
+            note[k] = inner
+
+    return note
 
 # ---- App creation ----
 def create_app() -> FastAPI:
