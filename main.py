@@ -338,37 +338,48 @@ def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> 
 # ---- Bedrock invocation + robust JSON extraction helpers ----
 def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:
     """
-    Bulletproof JSON finder. It looks for the last top-level JSON object in the string,
-    ignoring any conversational text or markdown fences.
+    A truly robust JSON finder. It locates the first occurrence of a complete
+    JSON object or array, ignoring any leading text or markdown fences.
     """
     if not text:
         return "", "Empty model output"
 
-    # Find the start of the last JSON object
-    last_brace_index = text.rfind('{')
-    if last_brace_index == -1:
-        return "", "Could not find JSON object in model output."
+    # Find the start of the first JSON object '{' or array '['
+    first_brace = text.find('{')
+    first_bracket = text.find('[')
 
-    # Find the matching closing brace
-    brace_level = 0
-    first_brace_found = False
-    end_brace_index = -1
-    for i in range(last_brace_index, len(text)):
+    # Determine which comes first, if any
+    start_index = -1
+    start_char = ''
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        start_index = first_brace
+        start_char = '{'
+    elif first_bracket != -1:
+        start_index = first_bracket
+        start_char = '['
+    else:
+        return "", "Could not find JSON object or array in model output."
+
+    end_char = '}' if start_char == '{' else ']'
+    level = 0
+    in_string = False
+
+    for i in range(start_index, len(text)):
         char = text[i]
-        if char == '{':
-            if not first_brace_found:
-                first_brace_found = True
-            brace_level += 1
-        elif char == '}':
-            brace_level -= 1
-            if first_brace_found and brace_level == 0:
-                end_brace_index = i + 1
-                break
-    
-    if end_brace_index == -1:
-        return "", "Could not find matching closing brace for JSON object."
 
-    return text[last_brace_index:end_brace_index], None
+        if char == '"' and (i == 0 or text[i-1] != '\\'):
+            in_string = not in_string
+        
+        if not in_string:
+            if char == start_char:
+                level += 1
+            elif char == end_char:
+                level -= 1
+        
+        if level == 0:
+            return text[start_index : i + 1], None
+
+    return "", "Could not find matching closing brace/bracket for JSON."
 
 
 def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
