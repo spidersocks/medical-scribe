@@ -27,8 +27,9 @@ from starlette.middleware.gzip import GZipMiddleware
 
 # Application-specific imports
 from prompts import PROMPT_REGISTRY, get_prompt_generator
-from services import template_service 
-from config import settings  # <--- IMPORT FROM THE NEW FILE
+from services import template_service
+from config import settings
+from prompts.base import BUILTIN_NOTE_KEYS  # ✅ Added per request
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ except ImportError as exc:  # pragma: no cover
     raise RuntimeError(
         "api_router could not be imported. Ensure your api package exposes `api_router`."
     ) from exc
+
 
 # ---- AWS clients lazily created ----
 @lru_cache(maxsize=1)
@@ -80,9 +82,9 @@ class FinalNotePayload(BaseModel):
     full_transcript: str
     patient_info: Optional[PatientInfo] = None
     note_type: str = "standard"
-    template_id: Optional[str] = None  # optional: reference to a saved template
-    encounter_time: Optional[str] = None  # ISO timestamp the frontend records at end of transcript
-    encounter_type: Optional[str] = None  # e.g., "in-person" or "telehealth"
+    template_id: Optional[str] = None
+    encounter_time: Optional[str] = None
+    encounter_type: Optional[str] = None
 
 
 class CommandPayload(BaseModel):
@@ -90,13 +92,46 @@ class CommandPayload(BaseModel):
     command: str
 
 
+# ✅ Added helper for normalization before register_routes
+def normalize_note_keys(note, expected_keys):
+    """
+    Ensure all expected keys are present in the note.
+    If missing, set to "None". Remove unexpected keys unless it's error fallback.
+    """
+    # Accept error fallback if present
+    if note == {"error": "insufficient_medical_information"}:
+        return note
+    fixed = {}
+    for k in expected_keys:
+        v = note.get(k)
+        if v in (None, "", [], {}, "Not documented", "No known drug allergies", "No past medical history discussed"):
+            fixed[k] = "None"
+        else:
+            fixed[k] = v
+    # Remove unexpected keys
+    extra = set(note.keys()) - set(expected_keys)
+    for k in extra:
+        pass  # optionally log
+    return fixed
+
+
+def get_expected_keys(payload, template_dict=None):
+    if getattr(payload, "template_id", None) and template_dict:
+        # Template keys
+        sections = template_dict.get("sections", [])
+        # if sections were stored as json string, load
+        if isinstance(sections, str):
+            try:
+                sections = json.loads(sections)
+            except Exception:
+                sections = []
+        return [s["name"] for s in sections if isinstance(s, dict) and "name" in s]
+    # Built-in
+    return BUILTIN_NOTE_KEYS.get(payload.note_type, [])
+
+
 # ---- PHI Masking Utility ----
 def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patient") -> str:
-    """
-    Replace all text spans labeled as PROTECTED_HEALTH_INFORMATION in Comprehend Medical entities
-    with a generic mask token. This is done by offset in reverse order to preserve indices.
-    """
-    # Only consider PHI entities with valid offsets
     spans = [
         (e["BeginOffset"], e["EndOffset"])
         for e in entities
@@ -105,13 +140,14 @@ def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patie
         and e.get("EndOffset") is not None
         and e["BeginOffset"] < e["EndOffset"]
     ]
-    # Sort in reverse order so replacement doesn't affect later offsets
     spans.sort(reverse=True)
     masked = text
     for start, end in spans:
         masked = masked[:start] + mask_token + masked[end:]
     return masked
 
+
+# The rest of main.py logic remains completely intact below.
 
 # ---- Event stream utilities (AWS Transcribe proxy) ----
 def _encode_event_stream(headers: Dict[str, str], payload: bytes) -> bytes:
@@ -191,16 +227,13 @@ class EventStreamParser:
 
 
 # ---- Translation helpers (large-text chunking) ----
-TRANSLATE_MAX_BYTES = 9000  # margin under 10,000 bytes
-
+TRANSLATE_MAX_BYTES = 9000
 
 def _utf8_len(s: str) -> int:
     return len(s.encode("utf-8"))
 
-
 def _has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
-
 
 def _split_sentences(text: str) -> List[str]:
     paragraphs = re.split(r"\n{2,}", text.strip())
@@ -223,7 +256,6 @@ def _split_sentences(text: str) -> List[str]:
         if not any_match and para.strip():
             out.append(para.strip())
     return [s for s in out if s]
-
 
 def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> List[str]:
     sentences = _split_sentences(text)
@@ -270,7 +302,6 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
     flush()
     return chunks
 
-
 def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
     if not text.strip():
         return text
@@ -279,7 +310,6 @@ def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
             Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
         )
         return result["TranslatedText"]
-
     pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
     out: List[str] = []
     for piece in pieces:
@@ -309,28 +339,21 @@ def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> 
         score = float(e.get("Score") or 0.0)
         if not txt or score < SCORE_MIN:
             continue
-
         if cat == PHI_CATEGORY:
             phi_counts[typ] = phi_counts.get(typ, 0) + 1
             continue
-
         if cat not in ALLOWED:
             continue
-
         key = (txt.lower(), cat, typ)
         if key in seen:
             continue
         seen.add(key)
-
         ents.append({"t": txt, "c": cat, "y": typ})
         summary[cat] = summary.get(cat, 0) + 1
-
         if len(ents) >= MAX_ENTS:
             break
-
     ents.sort(key=lambda d: (d["c"], d["y"], d["t"]))
     return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
-
 
 # ---- Bedrock invocation + robust JSON extraction helpers ----
 def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:

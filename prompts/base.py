@@ -32,3 +32,48 @@ CORE_PRINCIPLES = """
 4. **CRITICAL: VALID JSON SYNTAX:** Ensure all JSON is perfectly formatted with proper quotes around all keys and string values.
 5. If there is truly insufficient medical information in the transcript, do NOT fabricate content. Instead, respond with a valid JSON object: {"error": "insufficient_medical_information"}. Do not produce any additional dialogue, clinical details, or roles that are not present in the transcript.
 """
+
+# --- Add built-in note key lists here ---
+BUILTIN_NOTE_KEYS = {
+    "standard": [
+        "Chief Complaint",
+        "History of Present Illness",
+        "Pertinent Negatives",
+        "Past Medical History",
+        "Medications",
+        "Assessment and Plan",
+    ],
+    "soap": [
+        "Subjective",
+        "Objective",
+        "Assessment",
+        "Plan",
+    ],
+    "hp": [
+        "Chief Complaint",
+        "History of Present Illness",
+        "Past Medical History",
+        "Past Surgical History",
+        "Family History",
+        "Social History",
+        "Medications",
+        "Allergies",
+        "Review of Systems",
+        "Physical Examination",
+        "Assessment and Plan",
+    ],
+    "consultation": [
+        "Consultation Request",
+        "History of Present Illness",
+        "Past Medical History",
+        "Past Surgical History",   # Sometimes optional, depending on prompt
+        "Family History",
+        "Social History",
+        "Current Medications",     # or "Medications"
+        "Allergies",
+        "Pertinent Physical Examination",
+        "Diagnostic Studies Reviewed",
+        "Assessment",
+        "Recommendations",
+    ],
+}
