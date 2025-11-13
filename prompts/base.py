@@ -18,8 +18,9 @@ def _format_encounter_time(encounter_time: str) -> str:
         return encounter_time
 
 def build_patient_context(patient_info: dict, encounter_time: str = None) -> str:
-    """Build the patient information context block used across all note types."""
-    if not patient_info and not encounter_time:
+    """Build the patient information context block used across all note types.
+    This function should only receive PHI-safe information."""
+    if not patient_info:
         return ""
     
     context_parts = []
@@ -34,8 +35,6 @@ def build_patient_context(patient_info: dict, encounter_time: str = None) -> str
             context_parts.append(f"Referring Physician: {patient_info['referring_physician']}")
         if patient_info.get("additional_context"):
             context_parts.append(f"Additional Context: {patient_info['additional_context']}")
-    if encounter_time:
-        context_parts.append(f"Encounter Time: {_format_encounter_time(encounter_time)}")
     
     if context_parts:
         return "\n\n**PATIENT INFORMATION:**\n" + "\n".join(context_parts)

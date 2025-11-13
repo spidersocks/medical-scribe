@@ -1000,9 +1000,25 @@ def register_routes(app: FastAPI) -> None:
             getattr(payload, "template_id", None),
         )
 
-        patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else None
+        patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else {}
 
         try:
+            # --- PHI SAFETY ---
+            # Create a sanitized version of patient info for the LLM prompt.
+            # Never pass raw patient identifiers to the model.
+            patient_info_safe = {
+                "age": patient_info_dict.get("age"),
+                "sex": patient_info_dict.get("sex"),
+                "referring_physician": "Dr. [REDACTED]" if patient_info_dict.get("referring_physician") else None,
+                "additional_context": patient_info_dict.get("additional_context") # Assume this is non-PHI context
+            }
+            # Remove None values for a cleaner prompt
+            patient_info_safe = {k: v for k, v in patient_info_safe.items() if v is not None}
+            
+            # The encounter time is also PHI and should not be sent to the LLM.
+            # We can, however, send the encounter *type* (e.g., telehealth).
+            encounter_type = getattr(payload, "encounter_type", None)
+
             # Translate to English if needed (chunked safely)
             if _has_cjk(full_transcript):
                 logger.info("Detected CJK characters. Translating to English with chunking.")
@@ -1028,19 +1044,15 @@ def register_routes(app: FastAPI) -> None:
             # Mask PHI entities in the transcript before sending to the LLM
             english_transcript_masked = _mask_phi_entities(english_transcript, entities)
 
-            # Prepare encounter metadata EARLY so we can pass it into the prompt generator
-            encounter_time = getattr(payload, "encounter_time", None)
-            encounter_type = getattr(payload, "encounter_type", None)
-
             # Determine base system prompt for the requested note type
             try:
                 prompt_module = get_prompt_generator(payload.note_type)
-                # Pass encounter_time so it is human-readable via build_patient_context
-                base_system_prompt = prompt_module.generate_prompt(patient_info_dict, encounter_time)
+                # Use ONLY the PHI-safe data for prompt generation
+                base_system_prompt = prompt_module.generate_prompt(patient_info_safe)
             except Exception as e:
                 logger.warning("Unknown note type '%s': %s. Falling back to standard prompt.", payload.note_type, e)
                 prompt_module = get_prompt_generator("standard")
-                base_system_prompt = prompt_module.generate_prompt(patient_info_dict, encounter_time)
+                base_system_prompt = prompt_module.generate_prompt(patient_info_safe)
 
             # Optionally augment with template instructions when template_id is provided
             final_system_prompt = base_system_prompt
@@ -1070,13 +1082,13 @@ def register_routes(app: FastAPI) -> None:
                     logger.exception("Failed to fetch/prepare template: %s", exc)
                     raise HTTPException(status_code=400, detail=f"Could not load template: {exc}") from exc
 
-            # Generate note using composed system prompt and pass patient/encounter metadata
+            # Generate note using composed system prompt and pass ONLY PHI-safe metadata
             final_note = generate_note_from_system_prompt(
                 final_system_prompt,
                 english_transcript_masked,
                 ents_compact,
-                patient_info=patient_info_dict,
-                encounter_time=encounter_time,
+                patient_info=patient_info_safe,
+                encounter_time=None,  # NEVER send encounter_time to the LLM
                 encounter_type=encounter_type,
                 temperature=temperature,
             )
