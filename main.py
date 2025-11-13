@@ -420,8 +420,9 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
         raise ValueError(f"Failed to read Bedrock response: {exc}") from exc
 
     # Log model output truncated for debugging
+    # DEBUG CHANGE: Log the *full* model output for temporary debugging.
     try:
-        logger.debug("MODEL OUTPUT (truncated 2000 chars): %s", (model_output or "")[:2000])
+        logger.debug("MODEL OUTPUT (full): %s", model_output)
     except Exception:
         logger.debug("MODEL OUTPUT (could not stringify)")
 
@@ -1033,14 +1034,6 @@ def register_routes(app: FastAPI) -> None:
                 raise HTTPException(
                     status_code=400,
                     detail="Transcript too short—contains insufficient medical detail for note generation."
-                )
-
-            medical_ents = [e for e in ents_compact.get("ents", [])
-                            if e["c"] in ("MEDICAL_CONDITION", "MEDICATION", "TEST_TREATMENT_PROCEDURE", "ANATOMY")]
-            if not medical_ents:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Transcript contains insufficient medical detail for note generation."
                 )
 
             # Mask PHI entities in the transcript before sending to the LLM
