@@ -20,7 +20,6 @@ import boto3
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from starlette.middleware.gzip import GZipMiddleware
@@ -29,7 +28,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from prompts import PROMPT_REGISTRY, get_prompt_generator
 from services import template_service
 from config import settings
-from prompts.base import BUILTIN_NOTE_KEYS  # ✅ Added per request
+from prompts.base import BUILTIN_NOTE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -82,58 +81,23 @@ class FinalNotePayload(BaseModel):
     full_transcript: str
     patient_info: Optional[PatientInfo] = None
     note_type: str = "standard"
-    template_id: Optional[str] = None
-    encounter_time: Optional[str] = None
-    encounter_type: Optional[str] = None
+    template_id: Optional[str] = None  # optional: reference to a saved template
+    encounter_time: Optional[str] = None  # ISO timestamp the frontend records at end of transcript
+    encounter_type: Optional[str] = None  # e.g., "in-person" or "telehealth"
 
 
 class CommandPayload(BaseModel):
     note_content: Dict[str, Any]
     command: str
 
-def normalize_note_keys(note, expected_keys):
-    """
-    Ensure all expected keys are present in the note.
-    Coerce placeholder / empty values to 'None'.
-    """
-    if note == {"error": "insufficient_medical_information"}:
-        return note
-    fixed = {}
-    for k in expected_keys:
-        v = note.get(k)
-        # Coerce single-item list style like [{"text": "undefined"}]
-        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict):
-            candidate = v[0].get("text")
-            if isinstance(candidate, str) and candidate.strip().lower() in _PLACEHOLDER_VALUES:
-                v = "None"
-
-        if isinstance(v, str) and v.strip().lower() in _PLACEHOLDER_VALUES:
-            fixed[k] = "None"
-        elif v in (None, "", [], {}):
-            fixed[k] = "None"
-        else:
-            fixed[k] = v
-    # Drop unexpected keys silently (or log if desired)
-    return fixed
-
-
-def get_expected_keys(payload, template_dict=None):
-    if getattr(payload, "template_id", None) and template_dict:
-        # Template keys
-        sections = template_dict.get("sections", [])
-        # if sections were stored as json string, load
-        if isinstance(sections, str):
-            try:
-                sections = json.loads(sections)
-            except Exception:
-                sections = []
-        return [s["name"] for s in sections if isinstance(s, dict) and "name" in s]
-    # Built-in
-    return BUILTIN_NOTE_KEYS.get(payload.note_type, [])
-
 
 # ---- PHI Masking Utility ----
 def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patient") -> str:
+    """
+    Replace all text spans labeled as PROTECTED_HEALTH_INFORMATION in Comprehend Medical entities
+    with a generic mask token. This is done by offset in reverse order to preserve indices.
+    """
+    # Only consider PHI entities with valid offsets
     spans = [
         (e["BeginOffset"], e["EndOffset"])
         for e in entities
@@ -142,14 +106,13 @@ def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patie
         and e.get("EndOffset") is not None
         and e["BeginOffset"] < e["EndOffset"]
     ]
+    # Sort in reverse order so replacement doesn't affect later offsets
     spans.sort(reverse=True)
     masked = text
     for start, end in spans:
         masked = masked[:start] + mask_token + masked[end:]
     return masked
 
-
-# The rest of main.py logic remains completely intact below.
 
 # ---- Event stream utilities (AWS Transcribe proxy) ----
 def _encode_event_stream(headers: Dict[str, str], payload: bytes) -> bytes:
@@ -229,13 +192,16 @@ class EventStreamParser:
 
 
 # ---- Translation helpers (large-text chunking) ----
-TRANSLATE_MAX_BYTES = 9000
+TRANSLATE_MAX_BYTES = 9000  # margin under 10,000 bytes
+
 
 def _utf8_len(s: str) -> int:
     return len(s.encode("utf-8"))
 
+
 def _has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
+
 
 def _split_sentences(text: str) -> List[str]:
     paragraphs = re.split(r"\n{2,}", text.strip())
@@ -258,6 +224,7 @@ def _split_sentences(text: str) -> List[str]:
         if not any_match and para.strip():
             out.append(para.strip())
     return [s for s in out if s]
+
 
 def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -> List[str]:
     sentences = _split_sentences(text)
@@ -304,6 +271,7 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
     flush()
     return chunks
 
+
 def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
     if not text.strip():
         return text
@@ -312,6 +280,7 @@ def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
             Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
         )
         return result["TranslatedText"]
+
     pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
     out: List[str] = []
     for piece in pieces:
@@ -341,21 +310,28 @@ def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> 
         score = float(e.get("Score") or 0.0)
         if not txt or score < SCORE_MIN:
             continue
+
         if cat == PHI_CATEGORY:
             phi_counts[typ] = phi_counts.get(typ, 0) + 1
             continue
+
         if cat not in ALLOWED:
             continue
+
         key = (txt.lower(), cat, typ)
         if key in seen:
             continue
         seen.add(key)
+
         ents.append({"t": txt, "c": cat, "y": typ})
         summary[cat] = summary.get(cat, 0) + 1
+
         if len(ents) >= MAX_ENTS:
             break
+
     ents.sort(key=lambda d: (d["c"], d["y"], d["t"]))
     return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
+
 
 # ---- Bedrock invocation + robust JSON extraction helpers ----
 def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:
@@ -567,10 +543,307 @@ def _prepare_template_instructions(template_item: dict) -> str:
     except Exception:
         parts.append("Sections: " + ", ".join(skeleton.keys()))
 
-    parts.append("\nIf a section is truly not applicable, set its value to the string \"None\" (without quotes).")
+    parts.append('\nIf a section is truly not applicable, set its value to the string "None" (without quotes).')
     parts.append("Do not invent additional top-level keys. Order of keys does not matter, but keys must match.")
 
     return "\n".join(parts)
+
+
+# ---- Key canonicalization and normalization helpers ----
+def _canonicalize_note_keys(
+    note: Dict[str, Any],
+    expected_keys: List[str],
+    note_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Map model output keys to the canonical expected keys (case-insensitive),
+    with a few common aliases per note type.
+    """
+    if not isinstance(note, dict) or not expected_keys:
+        return note
+
+    # Base mapping: case-insensitive exact matches
+    canonical_map = {ek.lower(): ek for ek in expected_keys}
+
+    # Note-type-specific aliases
+    if note_type == "soap":
+        canonical_map.update({
+            "subjective": "Subjective",
+            "subj": "Subjective",
+            "s": "Subjective",
+            "objective": "Objective",
+            "obj": "Objective",
+            "o": "Objective",
+            "assessment": "Assessment",
+            "a": "Assessment",
+            "plan": "Plan",
+            "p": "Plan",
+        })
+    elif note_type == "standard":
+        canonical_map.update({
+            "chief complaint": "Chief Complaint",
+            "history of present illness": "History of Present Illness",
+            "pertinent negatives": "Pertinent Negatives",
+            "past medical history": "Past Medical History",
+            "medications": "Medications",
+            "assessment and plan": "Assessment and Plan",
+        })
+    elif note_type == "consultation":
+        canonical_map.update({
+            "consultation request": "Consultation Request",
+            "history of present illness": "History of Present Illness",
+            "past medical history": "Past Medical History",
+            "past surgical history": "Past Surgical History",
+            "family history": "Family History",
+            "social history": "Social History",
+            "current medications": "Current Medications",
+            "medications": "Current Medications",
+            "allergies": "Allergies",
+            "pertinent physical examination": "Pertinent Physical Examination",
+            "physical examination": "Pertinent Physical Examination",
+            "diagnostic studies reviewed": "Diagnostic Studies Reviewed",
+            "diagnostic studies": "Diagnostic Studies Reviewed",
+            "assessment": "Assessment",
+            "recommendations": "Recommendations",
+        })
+    elif note_type == "hp":
+        canonical_map.update({
+            "chief complaint": "Chief Complaint",
+            "history of present illness": "History of Present Illness",
+            "past medical history": "Past Medical History",
+            "past surgical history": "Past Surgical History",
+            "family history": "Family History",
+            "social history": "Social History",
+            "medications": "Medications",
+            "allergies": "Allergies",
+            "review of systems": "Review of Systems",
+            "physical examination": "Physical Examination",
+            "assessment and plan": "Assessment and Plan",
+        })
+
+    out: Dict[str, Any] = {}
+    # First pass: move any keys that match (case-insensitive/alias)
+    for k, v in list(note.items()):
+        kl = k.lower() if isinstance(k, str) else k
+        target = canonical_map.get(kl) if isinstance(kl, str) else None
+        if target:
+            # Prefer non-empty existing if duplicate
+            if target in out and out[target] not in (None, "", [], {}):
+                continue
+            out[target] = v
+        else:
+            # Keep unknowns for now; they may be dropped later by normalize
+            out[k] = v
+
+    return out
+
+
+# ---- Placeholder coercion and key normalization ----
+_PLACEHOLDER_VALUES = {
+    "undefined",
+    "null",
+    "none",
+    "n/a",
+    "na",
+    "not provided",
+    "not discussed",
+    "not mentioned",
+    "empty",
+    "",
+}
+
+
+def _coerce_placeholder_to_none(val: Any) -> Any:
+    """
+    Convert various placeholder / empty sentinel strings to the literal 'None'.
+    Leaves structured objects/lists unless they themselves contain placeholder-only content.
+    """
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in _PLACEHOLDER_VALUES:
+            return "None"
+        # Catch short variants like "none." or "none," etc.
+        if v.startswith("none") and len(v) <= 6:
+            return "None"
+    return val
+
+
+def _sanitize_note_values(note: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Walk all top-level sections and:
+    - Coerce placeholder strings to 'None'
+    - If a list contains a single object whose 'text' is placeholder, set the section to 'None'
+    - If a list is empty, set to 'None'
+    """
+    if not isinstance(note, dict):
+        return note
+
+    for k, v in list(note.items()):
+        # Direct string case
+        if isinstance(v, str):
+            note[k] = _coerce_placeholder_to_none(v)
+            continue
+
+        # List case
+        if isinstance(v, list):
+            if len(v) == 0:
+                note[k] = "None"
+                continue
+            if len(v) == 1 and isinstance(v[0], dict):
+                inner_text = str(v[0].get("text", "")).strip().lower()
+                if inner_text in _PLACEHOLDER_VALUES or (inner_text.startswith("none") and len(inner_text) <= 6):
+                    note[k] = "None"
+                    continue
+            # Also sanitize each {"text": "..."} element if needed
+            sanitized_list = []
+            for item in v:
+                if isinstance(item, dict) and "text" in item:
+                    coerced = _coerce_placeholder_to_none(item["text"])
+                    if coerced == "None":
+                        sanitized_list.append({"text": "None"})
+                    else:
+                        sanitized_list.append({"text": item["text"]})
+                else:
+                    sanitized_list.append(item)
+            note[k] = sanitized_list
+            continue
+
+        # Dict sub-sections (e.g., Physical Examination object) – shallow sanitize fields
+        if isinstance(v, dict):
+            inner = {}
+            for ik, iv in v.items():
+                if isinstance(iv, str):
+                    inner[ik] = _coerce_placeholder_to_none(iv)
+                else:
+                    inner[ik] = iv
+            note[k] = inner
+
+    return note
+
+
+def normalize_note_keys(note: Dict[str, Any], expected_keys: List[str]) -> Dict[str, Any]:
+    """
+    Ensure all expected keys are present in the note.
+    Coerce placeholder / empty values to 'None' and drop extras.
+    """
+    if note == {"error": "insufficient_medical_information"}:
+        return note
+    if not isinstance(note, dict):
+        return {k: "None" for k in expected_keys}
+
+    fixed: Dict[str, Any] = {}
+    for k in expected_keys:
+        v = note.get(k)
+
+        # Coerce single-item list style like [{"text": "undefined"}]
+        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict):
+            candidate = v[0].get("text")
+            if isinstance(candidate, str) and candidate.strip().lower() in _PLACEHOLDER_VALUES:
+                v = "None"
+
+        if isinstance(v, str) and v.strip().lower() in _PLACEHOLDER_VALUES:
+            fixed[k] = "None"
+        elif v in (None, "", [], {}):
+            fixed[k] = "None"
+        else:
+            fixed[k] = v
+
+    # Unexpected keys are dropped (can log if desired)
+    return fixed
+
+
+def get_expected_keys(payload: FinalNotePayload, template_dict: Optional[dict] = None) -> List[str]:
+    if getattr(payload, "template_id", None) and template_dict:
+        # Template keys
+        sections = template_dict.get("sections", [])
+        if isinstance(sections, str):
+            try:
+                sections = json.loads(sections)
+            except Exception:
+                sections = []
+        return [s["name"] for s in sections if isinstance(s, dict) and "name" in s]
+    # Built-in
+    return BUILTIN_NOTE_KEYS.get(payload.note_type, [])
+
+
+# ---- small normalization helpers used after LLM output ----
+def _normalize_assessment_plan(note: Dict[str, Any]) -> Dict[str, Any]:
+    ap_section = note.get("Assessment and Plan")
+    if isinstance(ap_section, str):
+        note["Assessment and Plan"] = ap_section.replace("\\n", "\n").strip()
+        logger.info("Normalized 'Assessment and Plan' section.")
+    return note
+
+
+def _fix_pertinent_negatives(note: Dict[str, Any]) -> Dict[str, Any]:
+    pn_section = note.get("Pertinent Negatives")
+    if isinstance(pn_section, str):
+        logger.warning("Converting string-based 'Pertinent Negatives' into structured list.")
+        cleaned = pn_section.lower().replace("patient denies", "").strip()
+        negatives = [entry.strip().rstrip(".") for entry in cleaned.split(",") if entry.strip()]
+        note["Pertinent Negatives"] = [{"text": negative.capitalize()} for negative in negatives]
+    return note
+
+
+def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
+    sections_to_check = ["Pertinent Negatives", "Past Medical History", "Medications"]
+    empty_markers = {
+        "no pertinent negatives",
+        "no past medical history",
+        "not discussed",
+        "none mentioned",
+        "none",
+        "n/a",
+        "na",
+        "not provided",
+        "undefined",
+        "null",
+        "empty"
+    }
+
+    for section in sections_to_check:
+        items = note.get(section)
+        value = ""
+
+        if isinstance(items, str):
+            value = items.strip().lower()
+        elif isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
+            value = items[0].get("text", "").strip().lstrip("-").lower()
+
+        if value in empty_markers or value == "":
+            if note.get(section) != "None":
+                logger.info("Normalizing empty section '%s' to 'None'. Raw value='%s'", section, value)
+                note[section] = "None"
+
+    return note
+
+
+# ---- App creation ----
+def create_app() -> FastAPI:
+    app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
+
+    app.add_middleware(GZipMiddleware, minimum_size=512)
+
+    allowed = settings.allowed_origins or ["*"]
+    allow_credentials = False if "*" in allowed else True
+    logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        max_age=86400,
+    )
+
+    # Avoid automatic trailing-slash redirect responses which can break CORS preflight flows
+    app.router.redirect_slashes = False
+
+    # include API router and register additional bespoke routes
+    app.include_router(api_router)
+    register_routes(app)
+    return app
 
 
 # -------- Routes registration (includes WebSocket proxy) --------
@@ -754,7 +1027,7 @@ def register_routes(app: FastAPI) -> None:
             logger.info("Comprehend Medical returned %d entities.", len(entities))
             ents_compact = _filter_and_compact_entities_for_llm(entities)
 
-            # Guardrail: ensure we have enough content before LLM
+            # --- Medical detail validation ---
             MIN_TRANSCRIPT_LENGTH = 50
             if len(english_transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
                 raise HTTPException(
@@ -780,7 +1053,7 @@ def register_routes(app: FastAPI) -> None:
             # Determine base system prompt for the requested note type
             try:
                 prompt_module = get_prompt_generator(payload.note_type)
-                # IMPORTANT: pass encounter_time so it is human-readable via build_patient_context
+                # Pass encounter_time so it is human-readable via build_patient_context
                 base_system_prompt = prompt_module.generate_prompt(patient_info_dict, encounter_time)
             except Exception as e:
                 logger.warning("Unknown note type '%s': %s. Falling back to standard prompt.", payload.note_type, e)
@@ -790,7 +1063,7 @@ def register_routes(app: FastAPI) -> None:
             # Optionally augment with template instructions when template_id is provided
             final_system_prompt = base_system_prompt
             temperature = 0.1  # default temperature
-            template_dict = None
+            template_dict: Optional[dict] = None
             if getattr(payload, "template_id", None):
                 if not template_service:
                     raise HTTPException(status_code=400, detail="Template support not available on server.")
@@ -826,21 +1099,36 @@ def register_routes(app: FastAPI) -> None:
                 temperature=temperature,
             )
 
-            # First pass: sanitize placeholders like 'undefined'
+            # DEBUG: log raw keys returned by model (to confirm casing/aliases)
+            try:
+                logger.debug("Raw model note keys: %s", list(final_note.keys()) if isinstance(final_note, dict) else type(final_note))
+            except Exception:
+                pass
+
+            # Determine expected keys for enforcement
+            expected_keys = get_expected_keys(payload, template_dict)
+
+            # 1) Canonicalize keys to expected case/aliases BEFORE sanitization
+            if expected_keys:
+                final_note = _canonicalize_note_keys(final_note, expected_keys, payload.note_type)
+
+            # 2) Sanitize placeholders like 'undefined' and empty shells
             final_note = _sanitize_note_values(final_note)
 
-            # Then apply expected key normalization (fills missing with 'None')
-            expected_keys = get_expected_keys(payload, template_dict)
+            # 3) Normalize: fill missing/empty sections with "None" and enforce keys
             if expected_keys:
                 final_note = normalize_note_keys(final_note, expected_keys)
 
-            # Existing standard-specific normalizations
+            # Optional normalization for "standard"
             if payload.note_type == "standard":
                 final_note = _normalize_assessment_plan(
                     _normalize_empty_sections(_fix_pertinent_negatives(final_note))
                 )
 
             return {"notes": final_note}
+        except HTTPException as exc:
+            # Preserve intended status codes (e.g., 400 guardrail failures)
+            raise exc
         except ValueError as exc:
             logger.error("Note generation error: %s", exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1024,164 +1312,6 @@ def _get_signature_key(key, date_stamp, region_name, service_name):
     k_service = _sign(k_region, service_name)
     k_signing = _sign(k_service, "aws4_request")
     return k_signing
-
-
-# ---- small normalization helpers used after LLM output ----
-def _normalize_assessment_plan(note: Dict[str, Any]) -> Dict[str, Any]:
-    ap_section = note.get("Assessment and Plan")
-    if isinstance(ap_section, str):
-        note["Assessment and Plan"] = ap_section.replace("\\n", "\n").strip()
-        logger.info("Normalized 'Assessment and Plan' section.")
-    return note
-
-
-def _fix_pertinent_negatives(note: Dict[str, Any]) -> Dict[str, Any]:
-    pn_section = note.get("Pertinent Negatives")
-    if isinstance(pn_section, str):
-        logger.warning("Converting string-based 'Pertinent Negatives' into structured list.")
-        cleaned = pn_section.lower().replace("patient denies", "").strip()
-        negatives = [entry.strip().rstrip(".") for entry in cleaned.split(",") if entry.strip()]
-        note["Pertinent Negatives"] = [{"text": negative.capitalize()} for negative in negatives]
-    return note
-
-
-def _normalize_empty_sections(note: Dict[str, Any]) -> Dict[str, Any]:
-    sections_to_check = ["Pertinent Negatives", "Past Medical History", "Medications"]
-    empty_markers = {
-        "no pertinent negatives",
-        "no past medical history",
-        "not discussed",
-        "none mentioned",
-        "none",
-        "n/a",
-        "na",
-        "not provided",
-        "undefined",
-        "null",
-        "empty"
-    }
-
-    for section in sections_to_check:
-        items = note.get(section)
-        value = ""
-
-        if isinstance(items, str):
-            value = items.strip().lower()
-        elif isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
-            value = items[0].get("text", "").strip().lstrip("-").lower()
-
-        if value in empty_markers or value == "":
-            if note.get(section) != "None":
-                logger.info("Normalizing empty section '%s' to 'None'. Raw value='%s'", section, value)
-                note[section] = "None"
-
-    return note
-
-# ---- NEW: Generic coercion & sanitization helpers ----
-_PLACEHOLDER_VALUES = {
-    "undefined",
-    "null",
-    "none",
-    "n/a",
-    "na",
-    "not provided",
-    "not discussed",
-    "not mentioned",
-    "empty",
-    "",
-}
-
-def _coerce_placeholder_to_none(val: Any) -> Any:
-    """
-    Convert various placeholder / empty sentinel strings to the literal 'None'.
-    Leaves structured objects/lists unless they themselves contain placeholder-only content.
-    """
-    if isinstance(val, str):
-        v = val.strip().lower()
-        if v in _PLACEHOLDER_VALUES:
-            return "None"
-        # Catch short variants like "none." or "none," etc.
-        if v.startswith("none") and len(v) <= 6:
-            return "None"
-    return val
-
-
-def _sanitize_note_values(note: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Walk all top-level sections and:
-    - Coerce placeholder strings to 'None'
-    - If a list contains a single object whose 'text' is placeholder, set the section to 'None'
-    - If a list is empty, set to 'None'
-    """
-    for k, v in list(note.items()):
-        # Direct string case
-        if isinstance(v, str):
-            note[k] = _coerce_placeholder_to_none(v)
-            continue
-
-        # List case
-        if isinstance(v, list):
-            if len(v) == 0:
-                note[k] = "None"
-                continue
-            if len(v) == 1 and isinstance(v[0], dict):
-                inner_text = str(v[0].get("text", "")).strip().lower()
-                if inner_text in _PLACEHOLDER_VALUES or (inner_text.startswith("none") and len(inner_text) <= 6):
-                    note[k] = "None"
-                    continue
-            # Also sanitize each {"text": "..."} element if needed
-            sanitized_list = []
-            for item in v:
-                if isinstance(item, dict) and "text" in item:
-                    coerced = _coerce_placeholder_to_none(item["text"])
-                    if coerced == "None":
-                        # If any item becomes None we still keep structure, unless you prefer collapsing
-                        sanitized_list.append({"text": "None"})
-                    else:
-                        sanitized_list.append({"text": item["text"]})
-                else:
-                    sanitized_list.append(item)
-            note[k] = sanitized_list
-            continue
-
-        # Dict sub-sections (e.g., Physical Examination object) – recursively sanitize shallow fields
-        if isinstance(v, dict):
-            inner = {}
-            for ik, iv in v.items():
-                if isinstance(iv, str):
-                    inner[ik] = _coerce_placeholder_to_none(iv)
-                else:
-                    inner[ik] = iv
-            note[k] = inner
-
-    return note
-
-# ---- App creation ----
-def create_app() -> FastAPI:
-    app = FastAPI(title="Stethoscribe Proxy", version="2.0.0")
-
-    app.add_middleware(GZipMiddleware, minimum_size=512)
-
-    allowed = settings.allowed_origins or ["*"]
-    allow_credentials = False if "*" in allowed else True
-    logger.info("CORS allow_origins: %s | allow_credentials=%s", allowed, allow_credentials)
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed,
-        allow_credentials=allow_credentials,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        max_age=86400,
-    )
-
-    # Avoid automatic trailing-slash redirect responses which can break CORS preflight flows
-    app.router.redirect_slashes = False
-
-    # include API router and register additional bespoke routes
-    app.include_router(api_router)
-    register_routes(app)
-    return app
 
 
 app = create_app()
