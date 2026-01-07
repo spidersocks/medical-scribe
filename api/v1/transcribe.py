@@ -33,6 +33,12 @@ logging.getLogger("dashscope").setLevel(logging.INFO)
 # --- Language mapping / heuristic (unchanged) ---
 CANTONESE_HINT_CHARS = set("嘅咩喺咗冇哋啲呢啦噉仲咪睇醫")
 def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
+    # Check for CJK characters first (prioritize content-based detection)
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        if any(ch in CANTONESE_HINT_CHARS for ch in text):
+            return "zh-HK"
+        return "zh-TW"
+    # If no CJK characters, trust the API language code
     if lang_raw:
         lr = lang_raw.lower()
         if lr.startswith("en"):
@@ -41,10 +47,6 @@ def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
             return "zh-HK"
         if lr.startswith("zh"):
             return "zh-TW"
-    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
-        if any(ch in CANTONESE_HINT_CHARS for ch in text):
-            return "zh-HK"
-        return "zh-TW"
     return "en-US"
 
 # --- AWS-shaped payload builder ---
