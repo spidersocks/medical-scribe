@@ -40,7 +40,7 @@ try:
     from api.v1.transcribe import transcribe_alibaba
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError(
-        "api_router could not be imported. Ensure your api package exposes `api_router`."
+        "API modules could not be imported. Ensure your api package and transcribe module are available."
     ) from exc
 
 
@@ -799,9 +799,16 @@ def register_routes(app: FastAPI) -> None:
     @app.websocket("/client-transcribe")
     async def client_transcribe(ws: WebSocket) -> None:
         """
-        Redirect to Alibaba Paraformer transcription implementation.
-        This endpoint now uses content-based language detection (CJK characters)
-        instead of unreliable ASR language labels.
+        Real-time medical transcription using Alibaba Paraformer.
+        
+        This endpoint delegates to the Alibaba Paraformer implementation which uses
+        content-based language detection (CJK characters) to accurately identify
+        Chinese text instead of relying on unreliable ASR language labels.
+        
+        Breaking Changes from AWS Transcribe:
+        - Query parameter 'language_code' is no longer used
+        - Language detection is now automatic based on text content
+        - Supports English, Mandarin (zh), and Cantonese (yue) via language_hints
         """
         # Delegate to the Alibaba implementation
         await transcribe_alibaba(ws)
