@@ -37,6 +37,7 @@ dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 # API router and services
 try:
     from api import api_router
+    from api.v1.transcribe import transcribe_alibaba
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError(
         "api_router could not be imported. Ensure your api package exposes `api_router`."
@@ -802,9 +803,6 @@ def register_routes(app: FastAPI) -> None:
         This endpoint now uses content-based language detection (CJK characters)
         instead of unreliable ASR language labels.
         """
-        # Import the Alibaba transcribe function
-        from api.v1.transcribe import transcribe_alibaba
-        
         # Delegate to the Alibaba implementation
         await transcribe_alibaba(ws)
 
