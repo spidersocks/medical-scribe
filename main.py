@@ -2,21 +2,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
 import re
-import struct
-from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
-from zlib import crc32
 from http import HTTPStatus
 
-import aiohttp
 import boto3
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -116,83 +109,6 @@ def _mask_phi_entities(text: str, entities: List[dict], mask_token: str = "patie
     for start, end in spans:
         masked = masked[:start] + mask_token + masked[end:]
     return masked
-
-
-# ---- Event stream utilities (AWS Transcribe proxy) ----
-def _encode_event_stream(headers: Dict[str, str], payload: bytes) -> bytes:
-    headers_payload = b""
-    for header_name, header_value in headers.items():
-        headers_payload += struct.pack(">B", len(header_name))
-        headers_payload += header_name.encode("utf-8")
-        headers_payload += struct.pack(">B", 7)
-        headers_payload += struct.pack(">H", len(header_value))
-        headers_payload += header_value.encode("utf-8")
-
-    headers_len = len(headers_payload)
-    total_len = 16 + headers_len + len(payload)
-
-    message = struct.pack(">I", total_len)
-    message += struct.pack(">I", headers_len)
-
-    prelude_crc = crc32(message)
-    message += struct.pack(">I", prelude_crc)
-
-    message += headers_payload
-    message += payload
-
-    message_crc = crc32(message)
-    message += struct.pack(">I", message_crc)
-
-    return message
-
-
-class EventStreamParser:
-    def __init__(self) -> None:
-        self._buffer = b""
-
-    def _parse_headers(self, header_data: bytes) -> Dict[str, str]:
-        headers: Dict[str, str] = {}
-        offset = 0
-        while offset < len(header_data):
-            header_name_len = header_data[offset]
-            offset += 1
-            header_name = header_data[offset: offset + header_name_len].decode("utf-8")
-            offset += header_name_len
-            header_value_type = header_data[offset]
-            offset += 1
-            if header_value_type == 7:
-                header_value_len = struct.unpack(">H", header_data[offset: offset + 2])[0]
-                offset += 2
-                header_value = header_data[offset: offset + header_value_len].decode("utf-8")
-                offset += header_value_len
-                headers[header_name] = header_value
-        return headers
-
-    def parse(self, chunk: bytes):
-        self._buffer += chunk
-        while len(self._buffer) >= 16:
-            try:
-                total_len, headers_len = struct.unpack(">II", self._buffer[0:8])
-                if len(self._buffer) < total_len:
-                    break
-
-                headers_and_payload = self._buffer[12: total_len - 4]
-                headers = self._parse_headers(headers_and_payload[:headers_len])
-                payload = headers_and_payload[headers_len:]
-
-                event = {"type": headers.get(":event-type"), "headers": headers}
-                content_type = headers.get(":content-type")
-                if content_type == "application/json":
-                    event["payload"] = json.loads(payload.decode("utf-8"))
-                else:
-                    event["payload"] = payload
-
-                yield event
-                self._buffer = self._buffer[total_len:]
-            except Exception as exc:
-                logger.error("EventStreamParser error: %s. Clearing buffer.", exc)
-                self._buffer = b""
-                break
 
 
 # ---- Translation helpers (large-text chunking) ----
@@ -881,163 +797,16 @@ def create_app() -> FastAPI:
 def register_routes(app: FastAPI) -> None:
     @app.websocket("/client-transcribe")
     async def client_transcribe(ws: WebSocket) -> None:
-        await ws.accept()
-
-        language_code = ws.query_params.get("language_code", "en-US")
-        if language_code not in {"en-US", "zh-HK", "zh-TW"}:
-            language_code = "en-US"
-
-        logger.info("Browser connected. Selected language=%s", language_code)
-
-        try:
-            aws_url = build_presigned_url(selected_language=language_code)
-        except RuntimeError as exc:
-            logger.error("Unable to build presigned URL: %s", exc)
-            await ws.close(code=1011, reason=str(exc))
-            return
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(aws_url, max_msg_size=0) as aws_ws:
-                    logger.info("Connected to AWS Transcribe.")
-
-                    async def forward_to_aws() -> None:
-                        try:
-                            while True:
-                                data = await ws.receive_bytes()
-                                await aws_ws.send_bytes(
-                                    _encode_event_stream(
-                                        headers={
-                                            ":message-type": "event",
-                                            ":event-type": "AudioEvent",
-                                            ":content-type": "application/octet-stream",
-                                        },
-                                        payload=data,
-                                    )
-                                )
-                        except WebSocketDisconnect:
-                            logger.info("Browser disconnected. Signalling EndOfStream to AWS.")
-                        finally:
-                            if not aws_ws.closed:
-                                try:
-                                    await aws_ws.send_bytes(
-                                        _encode_event_stream(
-                                            headers={
-                                                ":message-type": "event",
-                                                ":event-type": "AudioEvent",
-                                                ":content-type": "application/octet-stream",
-                                            },
-                                            payload=b"",
-                                        )
-                                    )
-                                    await aws_ws.send_bytes(
-                                        _encode_event_stream(
-                                            headers={
-                                                ":message-type": "event",
-                                                ":event-type": "EndOfStream",
-                                            },
-                                            payload=b"",
-                                        )
-                                    )
-                                except Exception as exc:
-                                    logger.warning("Error while sending EndOfStream: %s", exc)
-
-                    async def forward_to_client() -> None:
-                        parser = EventStreamParser()
-                        async for message in aws_ws:
-                            if message.type != aiohttp.WSMsgType.BINARY:
-                                continue
-
-                            for event in parser.parse(message.data):
-                                event_type = event.get("type")
-                                if event_type != "TranscriptEvent":
-                                    logger.debug("Received non-transcript event from AWS: %s", event)
-                                    continue
-
-                                payload = event["payload"]
-                                try:
-                                    results = payload.get("Transcript", {}).get("Results", [])
-                                    if not results:
-                                        continue
-
-                                    result = results[0]
-                                    if result.get("IsPartial", True):
-                                        if ws.client_state == WebSocketState.CONNECTED:
-                                            await ws.send_text(json.dumps(payload))
-                                        continue
-
-                                    original_text = result.get("Alternatives", [{}])[0].get("Transcript", "")
-                                    if not original_text:
-                                        continue
-
-                                    detected_language = result.get("LanguageCode", "en-US")
-                                    payload["DisplayText"] = original_text
-
-                                    if detected_language == "en-US":
-                                        english_text = original_text
-                                    else:
-                                        # Use Qwen-MT for WebSocket translation
-                                        sys_prompt = "You are a medical translator. Translate to English. Output ONLY the translation."
-                                        try:
-                                            resp = dashscope.Generation.call(
-                                                model='qwen-mt-turbo',
-                                                messages=[
-                                                    {'role': Role.SYSTEM, 'content': sys_prompt},
-                                                    {'role': Role.USER, 'content': original_text}
-                                                ],
-                                                result_format='message'
-                                            )
-                                            if resp.status_code == HTTPStatus.OK:
-                                                english_text = resp.output.choices[0].message.content.strip()
-                                            else:
-                                                english_text = original_text
-                                        except Exception:
-                                            english_text = original_text
-                                        
-                                        payload["TranslatedText"] = english_text
-
-                                    entities = get_comprehend_client().detect_entities_v2(Text=english_text)
-                                    payload["ComprehendEntities"] = entities.get("Entities", [])
-                                    logger.info(
-                                        "Processed final segment (%s). Entities=%d",
-                                        detected_language,
-                                        len(payload["ComprehendEntities"]),
-                                    )
-                                except Exception as exc:
-                                    logger.error("Real-time processing error: %s", exc)
-
-                                if ws.client_state == WebSocketState.CONNECTED:
-                                    await ws.send_text(json.dumps(payload))
-
-                        if aws_ws.close_code != 1000:
-                            reason = aws_ws.exception() or f"Code: {aws_ws.close_code}"
-                            raise ConnectionAbortedError(
-                                f"AWS connection closed unexpectedly. Reason: {reason}"
-                            )
-
-                    client_reader = asyncio.create_task(forward_to_aws())
-                    aws_reader = asyncio.create_task(forward_to_client())
-
-                    done, pending = await asyncio.wait(
-                        [client_reader, aws_reader],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    for task in done:
-                        if task.exception():
-                            logger.error("Proxy task failed with exception: %s", task.exception())
-
-                    for task in pending:
-                        task.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-
-        except Exception as exc:
-            logger.error("WebSocket proxy failed: %s", exc)
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.close(code=1011, reason="Internal server error.")
-        finally:
-            logger.info("Browser session ended.")
+        """
+        Redirect to Alibaba Paraformer transcription implementation.
+        This endpoint now uses content-based language detection (CJK characters)
+        instead of unreliable ASR language labels.
+        """
+        # Import the Alibaba transcribe function
+        from api.v1.transcribe import transcribe_alibaba
+        
+        # Delegate to the Alibaba implementation
+        await transcribe_alibaba(ws)
 
     @app.post("/generate-final-note")
     async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
@@ -1279,87 +1048,6 @@ def register_routes(app: FastAPI) -> None:
                 logger.warning("Could not load templates for user %s: %s", user_id, exc)
 
         return {"note_types": response}
-
-
-# ---- helper utilities for presigned transcribe URL ----
-def build_presigned_url(selected_language: str = "en-US") -> str:
-    if not settings.aws_access_key_id or not settings.aws_secret_access_key:
-        raise RuntimeError(
-            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required to build the Transcribe presigned URL."
-        )
-
-    if selected_language in ("zh-HK", "zh-TW"):
-        language_options = f"{selected_language},en-US"
-    else:
-        language_options = "en-US,zh-HK"
-
-    method = "GET"
-    service = "transcribe"
-    host = f"transcribestreaming.{settings.aws_region}.amazonaws.com:8443"
-    endpoint = f"wss://{host}/stream-transcription-websocket"
-
-    timestamp = datetime.now(timezone.utc)
-    amz_date = timestamp.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = timestamp.strftime("%Y%m%d")
-    canonical_uri = "/stream-transcription-websocket"
-
-    query_params = {
-        "identify-multiple-languages": "true",
-        "language-options": language_options,
-        "preferred-language": language_options.split(",", 1)[0],
-        "show-speaker-label": "true",
-        "media-encoding": "pcm",
-        "sample-rate": "16000",
-        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-        "X-Amz-Credential": f"{settings.aws_access_key_id}/{date_stamp}/{settings.aws_region}/{service}/aws4_request",
-        "X-Amz-Date": amz_date,
-        "X-Amz-Expires": "300",
-        "X-Amz-SignedHeaders": "host",
-    }
-
-    if settings.aws_session_token:
-        query_params["X-Amz-Security-Token"] = settings.aws_session_token
-
-    canonical_querystring = "&".join(
-        f"{key}={quote(str(value), safe='~')}" for key, value in sorted(query_params.items())
-    )
-    canonical_headers = f"host:{host}\n"
-    signed_headers = "host"
-    payload_hash = hashlib.sha256(b"").hexdigest()
-
-    canonical_request = (
-        f"{method}\n"
-        f"{canonical_uri}\n"
-        f"{canonical_querystring}\n"
-        f"{canonical_headers}\n"
-        f"{signed_headers}\n"
-        f"{payload_hash}"
-    )
-
-    credential_scope = f"{date_stamp}/{settings.aws_region}/{service}/aws4_request"
-    string_to_sign = (
-        "AWS4-HMAC-SHA256\n"
-        f"{amz_date}\n"
-        f"{credential_scope}\n"
-        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
-    )
-
-    signing_key = _get_signature_key(settings.aws_secret_access_key, date_stamp, settings.aws_region, service)
-    signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    return f"{endpoint}?{canonical_querystring}&X-Amz-Signature={signature}"
-
-
-def _sign(key, msg):
-    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-
-def _get_signature_key(key, date_stamp, region_name, service_name):
-    k_date = _sign(("AWS4" + key).encode("utf-8"), date_stamp)
-    k_region = _sign(k_date, region_name)
-    k_service = _sign(k_region, service_name)
-    k_signing = _sign(k_service, "aws4_request")
-    return k_signing
 
 
 app = create_app()

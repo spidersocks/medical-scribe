@@ -20,8 +20,8 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 DBG = os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1"
-DO_TRANSLATE = os.getenv("ENABLE_ALIBABA_TRANSLATION") == "1"
-DO_ENTITIES = os.getenv("ENABLE_ALIBABA_ENTITIES") == "1"
+DO_TRANSLATE = os.getenv("ENABLE_ALIBABA_TRANSLATION", "1") == "1"
+DO_ENTITIES = os.getenv("ENABLE_ALIBABA_ENTITIES", "1") == "1"
 
 if DBG:
     logger.setLevel(logging.DEBUG)
