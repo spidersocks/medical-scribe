@@ -14,6 +14,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zlib import crc32
+from http import HTTPStatus
 
 import aiohttp
 import boto3
@@ -24,6 +25,9 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from starlette.middleware.gzip import GZipMiddleware
 
+import dashscope
+from dashscope.api_entities.dashscope_response import Role
+
 # Application-specific imports
 from prompts import PROMPT_REGISTRY, get_prompt_generator
 from services import template_service
@@ -33,6 +37,9 @@ from prompts.base import BUILTIN_NOTE_KEYS
 # --- Force DEBUG logging level ---
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# Initialize DashScope
+dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 
 # API router and services
 try:
@@ -63,11 +70,6 @@ def get_comprehend_client():
 @lru_cache(maxsize=1)
 def get_bedrock_client():
     return get_boto3_session().client("bedrock-runtime")
-
-
-@lru_cache(maxsize=1)
-def get_translate_client():
-    return get_boto3_session().client("translate")
 
 
 # ---- Models for routes ----
@@ -275,21 +277,45 @@ def _chunk_text_for_translate(text: str, max_bytes: int = TRANSLATE_MAX_BYTES) -
 
 
 def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
+    """
+    Translates large text using Qwen-MT via DashScope, handling chunking.
+    """
     if not text.strip():
         return text
+
+    # Set up prompt based on target language
+    if target_lang == "en":
+        sys_prompt = "You are a specialized medical translator. Translate the following text (which may be Cantonese, Mandarin, or mixed Chinese) into English. Preserve medical terminology accuracy. Output ONLY the English translation."
+    elif target_lang == "zh-TW":
+        sys_prompt = "You are a specialized translator. Convert the following text into Traditional Chinese (Hong Kong standard). Output ONLY the converted text."
+    else:
+        sys_prompt = f"Translate the following text to {target_lang}. Output ONLY the translation."
+
+    def _call_qwen(chunk: str) -> str:
+        try:
+            response = dashscope.Generation.call(
+                model='qwen-mt-turbo',
+                messages=[
+                    {'role': Role.SYSTEM, 'content': sys_prompt},
+                    {'role': Role.USER, 'content': chunk}
+                ],
+                result_format='message'
+            )
+            if response.status_code == HTTPStatus.OK:
+                return response.output.choices[0].message.content.strip()
+            else:
+                return chunk
+        except Exception as e:
+            logger.error("Translation error: %s", e)
+            return chunk
+
     if _utf8_len(text) <= TRANSLATE_MAX_BYTES:
-        result = get_translate_client().translate_text(
-            Text=text, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
-        )
-        return result["TranslatedText"]
+        return _call_qwen(text)
 
     pieces = _chunk_text_for_translate(text, TRANSLATE_MAX_BYTES)
     out: List[str] = []
     for piece in pieces:
-        res = get_translate_client().translate_text(
-            Text=piece, SourceLanguageCode=source_lang, TargetLanguageCode=target_lang
-        )
-        out.append(res["TranslatedText"])
+        out.append(_call_qwen(piece))
     return "\n\n".join(out)
 
 
@@ -950,13 +976,24 @@ def register_routes(app: FastAPI) -> None:
                                     if detected_language == "en-US":
                                         english_text = original_text
                                     else:
-                                        source_lang = detected_language.split("-")[0]
-                                        translation = get_translate_client().translate_text(
-                                            Text=original_text,
-                                            SourceLanguageCode=source_lang,
-                                            TargetLanguageCode="en",
-                                        )
-                                        english_text = translation["TranslatedText"]
+                                        # Use Qwen-MT for WebSocket translation
+                                        sys_prompt = "You are a medical translator. Translate to English. Output ONLY the translation."
+                                        try:
+                                            resp = dashscope.Generation.call(
+                                                model='qwen-mt-turbo',
+                                                messages=[
+                                                    {'role': Role.SYSTEM, 'content': sys_prompt},
+                                                    {'role': Role.USER, 'content': original_text}
+                                                ],
+                                                result_format='message'
+                                            )
+                                            if resp.status_code == HTTPStatus.OK:
+                                                english_text = resp.output.choices[0].message.content.strip()
+                                            else:
+                                                english_text = original_text
+                                        except Exception:
+                                            english_text = original_text
+                                        
                                         payload["TranslatedText"] = english_text
 
                                     entities = get_comprehend_client().detect_entities_v2(Text=english_text)
@@ -1036,9 +1073,9 @@ def register_routes(app: FastAPI) -> None:
             # We can, however, send the encounter *type* (e.g., telehealth).
             encounter_type = getattr(payload, "encounter_type", None)
 
-            # Translate to English if needed (chunked safely)
+            # Translate to English if needed (chunked safely) using Qwen-MT
             if _has_cjk(full_transcript):
-                logger.info("Detected CJK characters. Translating to English with chunking.")
+                logger.info("Detected CJK characters. Translating to English with Qwen-MT (chunked).")
                 english_transcript = _translate_large_text("zh", "en", full_transcript)
                 logger.info("Translation complete. English transcript length=%d.", len(english_transcript))
             else:
@@ -1197,7 +1234,7 @@ def register_routes(app: FastAPI) -> None:
         Return available builtin note types and, when user_id is supplied, the user's custom templates.
 
         Template entries are returned with:
-          - id: "template:<uuid>"
+          - id: "template:"
           - name: template name
           - description: "Custom template"
           - source: "template"
@@ -1206,7 +1243,7 @@ def register_routes(app: FastAPI) -> None:
         Builtin prompt modules are returned with:
           - id: key from PROMPT_REGISTRY (e.g., "standard")
           - name: module.NOTE_TYPE
-          - description: "Generate a <NOTE_TYPE>"
+          - description: "Generate a "
           - source: "builtin"
         """
         response: List[Dict[str, Any]] = []

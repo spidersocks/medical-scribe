@@ -1,53 +1,75 @@
 from __future__ import annotations
 
+import os
+from http import HTTPStatus
 from typing import Any, Dict, List, Optional
 
+import dashscope
+from dashscope.api_entities.dashscope_response import Role
+
 from data.dynamodb import get_session
+
+# Ensure API key is available
+dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 
 
 def get_comprehend_client():
     return get_session().client("comprehendmedical")
 
 
-def get_translate_client():
-    return get_session().client("translate")
-
-
-def to_english(text: str, detected_language: Optional[str]) -> str:
-    if not text:
-        return ""
-    if not detected_language:
+def _qwen_translate(text: str, system_prompt: str) -> str:
+    """
+    Helper to call Qwen-MT via DashScope for translation.
+    """
+    if not text.strip():
         return text
-    # If it's already English-ish, skip translation
-    if detected_language.lower().startswith("en"):
-        return text
+    
     try:
-        source = detected_language.split("-")[0]
-        res = get_translate_client().translate_text(
-            Text=text,
-            SourceLanguageCode=source or "auto",
-            TargetLanguageCode="en",
+        response = dashscope.Generation.call(
+            model='qwen-mt-turbo',
+            messages=[
+                {'role': Role.SYSTEM, 'content': system_prompt},
+                {'role': Role.USER, 'content': text}
+            ],
+            result_format='message'
         )
-        return res.get("TranslatedText", text)
+        if response.status_code == HTTPStatus.OK:
+            return response.output.choices[0].message.content.strip()
+        else:
+            # On failure return original text
+            return text
     except Exception:
         return text
+
+
+def to_english(text: str, detected_language: Optional[str] = None) -> str:
+    if not text:
+        return ""
+    
+    # If explicitly English, we can skip.
+    if detected_language and detected_language.lower().startswith("en"):
+        return text
+
+    # Prompt designed to handle mixed Cantonese/Mandarin and medical context
+    sys_prompt = (
+        "You are a specialized medical translator. Translate the following text "
+        "(which may be Cantonese, Mandarin, or mixed Chinese) into English. "
+        "Preserve medical terminology accuracy. Output ONLY the English translation."
+    )
+    return _qwen_translate(text, sys_prompt)
+
 
 def to_traditional_chinese(text: str) -> str:
     """
-    Translates Simplified Chinese text to Traditional Chinese.
+    Translates Simplified Chinese text (from Paraformer) to Traditional Chinese.
     """
     if not text:
         return ""
-    try:
-        res = get_translate_client().translate_text(
-            Text=text,
-            SourceLanguageCode="zh",
-            TargetLanguageCode="zh-TW",
-        )
-        return res.get("TranslatedText", text)
-    except Exception:
-        # Fallback to original text on any error
-        return text
+    sys_prompt = (
+        "You are a specialized translator. Convert the following text into "
+        "Traditional Chinese (Hong Kong standard). Output ONLY the converted text."
+    )
+    return _qwen_translate(text, sys_prompt)
 
 
 def detect_entities(text_en: str) -> List[Dict[str, Any]]:
