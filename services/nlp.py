@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from http import HTTPStatus
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,8 @@ import dashscope
 from dashscope.api_entities.dashscope_response import Role
 
 from data.dynamodb import get_session
+
+logger = logging.getLogger(__name__)
 
 # Ensure API key is available
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -37,8 +40,14 @@ def _qwen_translate(text: str, system_prompt: str) -> str:
             return response.output.choices[0].message.content.strip()
         else:
             # On failure return original text
+            logger.error(
+                "Translation failed with status %s: %s",
+                response.status_code,
+                getattr(response, 'message', 'No error message')
+            )
             return text
-    except Exception:
+    except Exception as e:
+        logger.error("Translation exception: %s", e, exc_info=True)
         return text
 
 
@@ -46,8 +55,11 @@ def to_english(text: str, detected_language: Optional[str] = None) -> str:
     if not text:
         return ""
     
-    # If explicitly English, we can skip.
-    if detected_language and detected_language.lower().startswith("en"):
+    # Check if text contains CJK characters (Chinese/Japanese/Korean)
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in text)
+    
+    # If explicitly English AND no CJK characters, we can skip.
+    if detected_language and detected_language.lower().startswith("en") and not has_cjk:
         return text
 
     # Prompt designed to handle mixed Cantonese/Mandarin and medical context
