@@ -204,6 +204,12 @@ class ParaformerCallback(RecognitionCallback):
             translated_text: Optional[str] = None
             entities: Optional[List[dict]] = None
             if is_final:
+                # Log detected language and raw text for debugging
+                logger.info(
+                    "[Final Sentence] detected_language=%s, text=%s",
+                    language_code,
+                    text[:100] + "..." if len(text) > 100 else text
+                )
                 if DO_TRANSLATE and nlp and not language_code.startswith("en"):
                     translated_text = nlp.to_english(text, language_code)
                 if DO_ENTITIES and nlp:
