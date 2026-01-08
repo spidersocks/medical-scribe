@@ -28,11 +28,13 @@ def _qwen_translate(text: str, system_prompt: str) -> str:
         return text
     
     try:
+        # qwen-mt-turbo only supports 'user' and 'assistant' roles, not 'system'
+        # So we prepend the system prompt to the user message
+        combined_message = f"{system_prompt}\n\n{text}"
         response = dashscope.Generation.call(
             model='qwen-mt-turbo',
             messages=[
-                {'role': Role.SYSTEM, 'content': system_prompt},
-                {'role': Role.USER, 'content': text}
+                {'role': Role.USER, 'content': combined_message}
             ],
             result_format='message'
         )

@@ -210,11 +210,13 @@ def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
 
     def _call_qwen(chunk: str) -> str:
         try:
+            # qwen-mt-turbo only supports 'user' and 'assistant' roles, not 'system'
+            # So we prepend the system prompt to the user message
+            combined_message = f"{sys_prompt}\n\n{chunk}"
             response = dashscope.Generation.call(
                 model='qwen-mt-turbo',
                 messages=[
-                    {'role': Role.SYSTEM, 'content': sys_prompt},
-                    {'role': Role.USER, 'content': chunk}
+                    {'role': Role.USER, 'content': combined_message}
                 ],
                 result_format='message'
             )
