@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # Initialize DashScope
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 
+# Target Alibaba Cloud Model
+DASHSCOPE_MODEL_ID = "qwen3-next-80b-a3b-instruct"
+
 # API router and services
 try:
     from api import api_router
@@ -59,11 +62,6 @@ def get_boto3_session() -> boto3.session.Session:
 @lru_cache(maxsize=1)
 def get_comprehend_client():
     return get_boto3_session().client("comprehendmedical")
-
-
-@lru_cache(maxsize=1)
-def get_bedrock_client():
-    return get_boto3_session().client("bedrock-runtime")
 
 
 # ---- Models for routes ----
@@ -280,7 +278,7 @@ def _filter_and_compact_entities_for_llm(raw_entities: List[Dict[str, Any]]) -> 
     return {"ents": ents, "ents_summary": summary, "phi_counts": phi_counts}
 
 
-# ---- Bedrock invocation + robust JSON extraction helpers ----
+# ---- DashScope invocation + robust JSON extraction helpers ----
 def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:
     """
     A truly robust JSON finder. It locates the first occurrence of a complete
@@ -339,35 +337,31 @@ def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
     return parsed
 
 
-def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens: int = 4096, temperature: float = 0.1) -> Dict[str, Any]:
+def _invoke_dashscope_and_parse(system_prompt: str, user_payload: str, temperature: float = 0.1) -> Dict[str, Any]:
     """
-    Invokes Bedrock model with composed prompt and returns parsed JSON object.
-    Simplifies prompt structure to avoid conversational-style responses.
+    Invokes Alibaba Cloud DashScope model and returns parsed JSON object.
+    Replaces the previous Bedrock invocation.
     """
-    # Combine the system prompt and the user payload directly.
-    composed_prompt = f"{system_prompt}\n\n{user_payload}"
-    try:
-        safe_prompt = composed_prompt.replace("\n", "\\n")
-        logger.debug("COMPOSED PROMPT (truncated 4000 chars): %s", safe_prompt[:4000])
-    except Exception:
-        logger.debug("COMPOSED PROMPT (could not stringify)")
-
-    body = json.dumps({"prompt": composed_prompt, "max_tokens": max_tokens, "temperature": temperature}, ensure_ascii=False)
+    messages = [
+        {'role': Role.SYSTEM, 'content': system_prompt},
+        {'role': Role.USER, 'content': user_payload}
+    ]
 
     try:
-        response = get_bedrock_client().invoke_model(
-            body=body,
-            modelId=settings.bedrock_model_id,
-            accept="application/json",
-            contentType="application/json",
+        response = dashscope.Generation.call(
+            model=DASHSCOPE_MODEL_ID,
+            messages=messages,
+            result_format='message',
+            temperature=temperature,
         )
-        response_body = json.loads(response.get("body").read())
-    except Exception as exc:
-        raise ValueError(f"Bedrock invocation or response body parsing failed: {exc}") from exc
 
-    # Handle cases where model output is nested, e.g., {"text": "{...}"}
-    model_output = response_body.get("outputs", [{}])[0].get("text", "")
-    stop_reason = response_body.get("outputs", [{}])[0].get("stop_reason")
+        if response.status_code == HTTPStatus.OK:
+            model_output = response.output.choices[0].message.content
+        else:
+            raise ValueError(f"DashScope API Error: {response.code} - {response.message}")
+
+    except Exception as exc:
+        raise ValueError(f"DashScope invocation failed: {exc}") from exc
 
     logger.debug("MODEL OUTPUT (full): %s", model_output)
 
@@ -382,7 +376,7 @@ def _invoke_bedrock_and_parse(system_prompt: str, user_payload: str, max_tokens:
     except Exception as exc:
         error_msg = (
             "Failed to parse JSON from final note even after repair. "
-            f"Stop Reason: {stop_reason}. Initial parse error: {exc}. "
+            f"Initial parse error: {exc}. "
             f"Full model output (first 2000 chars): '{model_output[:2000]}'"
         )
         raise ValueError(error_msg) from exc
@@ -398,8 +392,7 @@ def generate_note_from_system_prompt(
     temperature: float = 0.1,
 ) -> Dict[str, Any]:
     """
-    High-level wrapper to prepare user payload and call Bedrock + parsing.
-    The payload is now a simple JSON string, not nested under a 'User:' block.
+    High-level wrapper to prepare user payload and call DashScope + parsing.
     """
     user_payload_obj = {
         "full_transcript": full_transcript,
@@ -416,19 +409,13 @@ def generate_note_from_system_prompt(
         user_payload_obj["encounter_type"] = encounter_type
 
     user_payload = json.dumps(user_payload_obj, ensure_ascii=False)
-    return _invoke_bedrock_and_parse(system_prompt, user_payload, max_tokens=4096, temperature=temperature)
+    return _invoke_dashscope_and_parse(system_prompt, user_payload, temperature=temperature)
 
 
 def _prepare_template_instructions(template_item: dict) -> str:
     """
     Convert the TemplateRead dict into a human-readable but strict instruction block
     that biases the LLM to produce a JSON note that matches the template sections.
-
-    The block contains:
-    - A human summary of sections and their descriptions.
-    - A required OUTPUT FORMAT section with an explicit JSON skeleton where keys
-      exactly match the template section names. The model is told to return ONLY
-      the JSON object (no surrounding explanation).
     """
     parts: List[str] = []
     name = template_item.get("name") or "Custom Template"
@@ -981,20 +968,24 @@ def register_routes(app: FastAPI) -> None:
             "Please execute this command and return only the resulting text."
         )
 
-        bedrock_body = json.dumps(
-            {"prompt": f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:", "max_tokens": 2048, "temperature": 0.2},
-            ensure_ascii=False
-        )
+        # DashScope Call
+        messages = [
+            {'role': Role.SYSTEM, 'content': system_prompt},
+            {'role': Role.USER, 'content': user_prompt}
+        ]
 
         try:
-            response = get_bedrock_client().invoke_model(
-                body=bedrock_body,
-                modelId=settings.bedrock_model_id,
-                accept="application/json",
-                contentType="application/json",
+            response = dashscope.Generation.call(
+                model=DASHSCOPE_MODEL_ID,
+                messages=messages,
+                result_format='message',
+                temperature=0.2
             )
-            response_body = json.loads(response.get("body").read())
-            result_text = response_body.get("outputs", [{}])[0].get("text", "").strip()
+            
+            if response.status_code == HTTPStatus.OK:
+                result_text = response.output.choices[0].message.content.strip()
+            else:
+                raise HTTPException(status_code=500, detail=f"DashScope error: {response.message}")
 
             if result_text.startswith("```") and result_text.endswith("```"):
                 result_text = result_text[3:-3].strip()
