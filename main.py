@@ -27,9 +27,21 @@ from services import template_service
 from config import settings
 from prompts.base import BUILTIN_NOTE_KEYS
 
-# --- Force DEBUG logging level ---
-logging.basicConfig(level=logging.DEBUG)
+# --- LOGGING CONFIGURATION ---
+# 1. Basic config for the app
+logging.basicConfig(
+    level=logging.INFO, # Changed default to INFO to reduce general noise
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# 2. Suppress noisy third-party libraries
+for lib in ['botocore', 'boto3', 'urllib3', 's3transfer', 'asyncio', 'websockets']:
+    logging.getLogger(lib).setLevel(logging.WARNING)
+
+# 3. Ensure our app logs are visible
+logging.getLogger("api").setLevel(logging.DEBUG)
+logging.getLogger("services").setLevel(logging.DEBUG)
 
 # Initialize DashScope
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -327,7 +339,7 @@ def _find_json_substring(text: str) -> Tuple[str, Optional[str]]:
 
 def _repair_and_parse_json(json_substring: str) -> Dict[str, Any]:
     """
-    Try to fix common mistakes and parse JSON. Raises JSONDecodeError or ValueError on failure.
+    Try to fix common mistakes and parse JSON.
     """
     s = json_substring
     # Quick pattern fixes observed from LLM outputs

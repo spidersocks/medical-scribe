@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4, uuid5, NAMESPACE_DNS
 from datetime import datetime, timezone
@@ -18,6 +18,8 @@ from schemas.transcript_segment import (
 )
 from services import nlp  # translate + comprehend
 import time
+
+logger = logging.getLogger(__name__)
 
 _CACHE_TTL = 2.0  # seconds
 _SEGMENTS_CACHE: dict[tuple[str, bool], tuple[float, list[dict]]] = {}  # (cid, include_entities) -> (ts, serialized list)
@@ -408,9 +410,12 @@ class TranscriptSegmentService(DynamoServiceMixin):
         Typically called periodically during a live session.
         """
         cid = str(consultation_id)
+        logger.info("[DIARIZE] Starting diarization job for consultation_id=%s", cid)
+
         # 1. Fetch all segments
         segments = await self.list_for_consultation(cid)
         if not segments:
+            logger.info("[DIARIZE] No segments found for %s", cid)
             return {"status": "no_segments"}
 
         # 2. Strategy: Process recent segments.
@@ -458,6 +463,7 @@ class TranscriptSegmentService(DynamoServiceMixin):
                 await self.update(sid, update_payload)
                 updated_count += 1
                 
+        logger.info("[DIARIZE] Completed job for %s. Updated %d segments.", cid, updated_count)
         return {
             "processed": len(target_segments),
             "updated": updated_count,

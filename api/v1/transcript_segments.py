@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from typing import List, Dict, Any
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Response, status, BackgroundTasks
 
 from api.deps import guard_service
 from schemas.transcript_segment import (
@@ -38,15 +39,26 @@ async def list_segments_for_consultation(
 async def create_segment_for_consultation(
     consultation_id: str,
     payload: TranscriptSegmentCreate,
+    background_tasks: BackgroundTasks,
 ) -> TranscriptSegmentRead:
     print("[transcript_segments] POST create called", {
         "consultation_id": consultation_id,
         "payload": payload.model_dump()
     })
     payload_with_consultation = payload.copy(update={"consultation_id": consultation_id})
-    return await guard_service(
+    
+    new_segment = await guard_service(
         transcript_segment_service.create(payload_with_consultation)
     )
+
+    # --- AUTO-DIARIZATION TRIGGER ---
+    # Every 5 segments, trigger a background diarization job.
+    # This ensures "live" updates without frontend polling changes.
+    if new_segment.sequence_number > 0 and new_segment.sequence_number % 5 == 0:
+        print(f"[Auto-Trigger] Queueing diarization for {consultation_id} at seq {new_segment.sequence_number}")
+        background_tasks.add_task(transcript_segment_service.diarize_consultation, consultation_id)
+
+    return new_segment
 
 
 @router.post(

@@ -163,6 +163,8 @@ def predict_speaker_roles(segments: List[Dict[str, Any]]) -> Dict[str, str]:
         for s in segments
     ]
     context_str = json.dumps(context_data, ensure_ascii=False, indent=2)
+    
+    logger.debug("[DIARIZE] Prompting Qwen with %d segments.", len(segments))
 
     system_prompt = (
         "You are an expert medical transcription assistant. "
@@ -189,7 +191,9 @@ def predict_speaker_roles(segments: List[Dict[str, Any]]) -> Dict[str, str]:
             content = response.output.choices[0].message.content
             json_str, err = _find_json_substring(content)
             if not err:
-                return _repair_and_parse_json(json_str)
+                parsed = _repair_and_parse_json(json_str)
+                logger.debug("[DIARIZE] Qwen response: %s", parsed)
+                return parsed
             else:
                 logger.warning("Failed to find JSON in diarization response: %s", content)
         else:
