@@ -61,6 +61,8 @@ class TranscriptSegmentUpdate(BaseModel):
     entities: EntitiesField = None
     entities_compact: Optional[List[EntityCompact]] = None
     entities_ref: Optional[Literal["original", "translated"]] = None
+    speaker_role: Optional[SpeakerField] = None
+    speaker_label: Optional[SpeakerField] = None
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 

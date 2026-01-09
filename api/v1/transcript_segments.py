@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Dict, Any
 
 from fastapi import APIRouter, Response, status
 
@@ -59,6 +59,22 @@ async def enrich_segments_for_consultation(
 ) -> dict:
     return await guard_service(
         transcript_segment_service.enrich_consultation(consultation_id, force=force)
+    )
+
+
+@router.post(
+    "/consultations/{consultation_id}/diarize",
+    status_code=status.HTTP_200_OK,
+)
+async def diarize_consultation_segments(
+    consultation_id: str,
+) -> Dict[str, Any]:
+    """
+    Trigger semantic diarization (speaker role assignment) for recent segments
+    using Qwen LLM. Useful for periodic updates during live sessions.
+    """
+    return await guard_service(
+        transcript_segment_service.diarize_consultation(consultation_id)
     )
 
 

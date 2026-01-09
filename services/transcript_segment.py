@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 import asyncio
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4, uuid5, NAMESPACE_DNS
 from datetime import datetime, timezone
 
@@ -19,7 +17,7 @@ from schemas.transcript_segment import (
     TranscriptSegmentUpdate,
 )
 from services import nlp  # translate + comprehend
-import time  # NEW
+import time
 
 _CACHE_TTL = 2.0  # seconds
 _SEGMENTS_CACHE: dict[tuple[str, bool], tuple[float, list[dict]]] = {}  # (cid, include_entities) -> (ts, serialized list)
@@ -332,24 +330,6 @@ class TranscriptSegmentService(DynamoServiceMixin):
         }
         return TranscriptSegmentRead.model_validate(response_data)
 
-        response_data = {
-            "segment_id": segment_id,
-            "consultation_id": consultation_id,
-            "sequence_number": segment_index,
-            "speaker_label": item.get("speaker_label"),
-            "speaker_role": item.get("speaker_role"),
-            "original_text": item.get("original_text") or "",
-            "translated_text": item.get("translated_text"),
-            "detected_language": item.get("detected_language"),
-            "start_time_ms": item.get("start_time_ms"),
-            "end_time_ms": item.get("end_time_ms"),
-            "entities": [],
-            "entities_compact": None,
-            "entities_ref": None,
-            "created_at": created_at,
-        }
-        return TranscriptSegmentRead.model_validate(response_data)
-
     async def get(self, segment_id: str | UUID) -> TranscriptSegmentRead:
         items = await self.scan_all()
         for it in items:
@@ -421,6 +401,68 @@ class TranscriptSegmentService(DynamoServiceMixin):
 
         key = {"consultationId": target["consultationId"], "segmentIndex": target["segmentIndex"]}
         await run_in_thread(self.table.delete_item, Key=key)
+
+    async def diarize_consultation(self, consultation_id: str | UUID) -> Dict[str, Any]:
+        """
+        Uses LLM (Qwen) to assign speaker roles (Doctor vs Patient) to recent segments.
+        Typically called periodically during a live session.
+        """
+        cid = str(consultation_id)
+        # 1. Fetch all segments
+        segments = await self.list_for_consultation(cid)
+        if not segments:
+            return {"status": "no_segments"}
+
+        # 2. Strategy: Process recent segments.
+        #    Taking the last 50 segments provides context and keeps latency/cost low.
+        WINDOW_SIZE = 50
+        
+        # Sort by sequence
+        segments.sort(key=lambda x: x.sequence_number)
+        
+        # Identify target slice
+        target_segments = segments[-WINDOW_SIZE:]
+        
+        # Prepare for NLP
+        payload_segments = []
+        for seg in target_segments:
+            # Prefer translated text for context if available, else original
+            txt = seg.translated_text if seg.translated_text else seg.original_text
+            payload_segments.append({
+                "id": str(seg.segment_id),
+                "text": txt
+            })
+            
+        # 3. Call NLP
+        role_map = await run_in_thread(nlp.predict_speaker_roles, payload_segments)
+        
+        # 4. Update segments
+        updated_count = 0
+        for seg in target_segments:
+            sid = str(seg.segment_id)
+            new_role = role_map.get(sid)
+            
+            # Normalize role string just in case
+            if new_role and new_role.lower() in ("doctor", "physician", "clinician"):
+                new_role = "Doctor"
+            elif new_role and new_role.lower() in ("patient", "client"):
+                new_role = "Patient"
+            
+            if new_role and new_role != seg.speaker_role:
+                # Update DB
+                # We update both speaker_role (semantic) and speaker_label (UI often uses this)
+                update_payload = TranscriptSegmentUpdate(
+                    speaker_role=new_role,
+                    speaker_label=new_role 
+                )
+                await self.update(sid, update_payload)
+                updated_count += 1
+                
+        return {
+            "processed": len(target_segments),
+            "updated": updated_count,
+            "roles_found": role_map
+        }
 
 transcript_segment_service = TranscriptSegmentService(
     table_env_name="TRANSCRIPT_SEGMENTS_TABLE_NAME",
