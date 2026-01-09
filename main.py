@@ -12,7 +12,7 @@ from http import HTTPStatus
 
 import boto3
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
@@ -23,7 +23,7 @@ from dashscope.api_entities.dashscope_response import Role
 
 # Application-specific imports
 from prompts import PROMPT_REGISTRY, get_prompt_generator
-from services import template_service
+from services import template_service, transcript_segment_service
 from config import settings
 from prompts.base import BUILTIN_NOTE_KEYS
 
@@ -92,6 +92,7 @@ class FinalNotePayload(BaseModel):
     template_id: Optional[str] = None  # optional: reference to a saved template
     encounter_time: Optional[str] = None  # ISO timestamp the frontend records at end of transcript
     encounter_type: Optional[str] = None  # e.g., "in-person" or "telehealth"
+    consultation_id: Optional[str] = None # Added for final cleanup diarization
 
 
 class CommandPayload(BaseModel):
@@ -815,7 +816,7 @@ def register_routes(app: FastAPI) -> None:
         await transcribe_alibaba(ws)
 
     @app.post("/generate-final-note")
-    async def generate_final_note(payload: FinalNotePayload) -> Dict[str, Any]:
+    async def generate_final_note(payload: FinalNotePayload, background_tasks: BackgroundTasks) -> Dict[str, Any]:
         # Clean speaker labels (e.g., "[sentence_1]: ...") from the transcript
         full_transcript = re.sub(r"\[[^\]]+\]:\s*", "", (payload.full_transcript or "")).strip()
 
@@ -828,6 +829,15 @@ def register_routes(app: FastAPI) -> None:
             payload.note_type,
             getattr(payload, "template_id", None),
         )
+
+        # --- FINAL CLEANUP DIARIZATION ---
+        # Trigger a final pass to label any trailing segments (segments % 5 != 0)
+        # that haven't been labeled yet. This ensures the DB is consistent.
+        if payload.consultation_id:
+            logger.info("Triggering final cleanup diarization for %s", payload.consultation_id)
+            background_tasks.add_task(transcript_segment_service.diarize_consultation, payload.consultation_id)
+        else:
+            logger.warning("No consultation_id provided in Generate Note payload; skipping final diarization.")
 
         patient_info_dict = payload.patient_info.model_dump(exclude_none=True) if payload.patient_info else {}
 
