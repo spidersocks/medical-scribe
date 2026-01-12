@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 DBG = os.getenv("DEBUG_ALIBABA_TRANSCRIBE") == "1"
 DO_TRANSLATE = os.getenv("ENABLE_ALIBABA_TRANSLATION", "1") == "1"
 DO_ENTITIES = os.getenv("ENABLE_ALIBABA_ENTITIES", "1") == "1"
+# Load Hotword ID from environment
+HOTWORD_ID = os.getenv("ALIBABA_HOTWORD_ID")
 
 if DBG:
     logger.setLevel(logging.DEBUG)
@@ -53,7 +55,7 @@ def map_lang_to_ui(lang_raw: Optional[str], text: str) -> str:
             return "zh-TW"
     return "en-US"
 
-# --- AWS-shaped payload builder ---
+# --- AWS-shaped payload builder (unchanged) ---
 def build_aws_payload(
     *,
     text: str,
@@ -92,7 +94,7 @@ def build_aws_payload(
         payload["_debug"] = debug
     return payload
 
-# --- Callback without diarization ---
+# --- Callback without diarization (unchanged) ---
 class ParaformerCallback(RecognitionCallback):
     """
     Streams Alibaba recognition events into an asyncio.Queue as AWS-shaped payloads.
@@ -362,17 +364,26 @@ async def transcribe_alibaba(
                 pass
 
     try:
-        recognizer = Recognition(
-            model="paraformer-realtime-v2",
-            format="pcm",
-            sample_rate=16000,
-            diarization_enabled=False,
-            language_hints=["en", "yue", "zh"],
-            callback=callback,
-            semantic_punctuation_enabled=False,
-            punctuation_prediction_enabled=True,
-            inverse_text_normalization_enabled=True,
-        )
+        # Build arguments for Recognition
+        rec_args = {
+            "model": "paraformer-realtime-v2",
+            "format": "pcm",
+            "sample_rate": 16000,
+            "diarization_enabled": False,
+            "language_hints": ["en", "yue", "zh"],
+            "callback": callback,
+            "semantic_punctuation_enabled": False,
+            "punctuation_prediction_enabled": True,
+            "inverse_text_normalization_enabled": True,
+        }
+        
+        # Inject Hotword ID if present in env
+        if HOTWORD_ID:
+            logger.info("Using Alibaba Hotword ID: %s", HOTWORD_ID)
+            rec_args["vocabulary_id"] = HOTWORD_ID
+
+        recognizer = Recognition(**rec_args)
+        
         recognizer.start()
         logger.info("DashScope recognizer started (placeholder speakers)")
 

@@ -13,6 +13,8 @@ ENV/
 env.bak/
 venv.bak/
 
+hotwords/
+
 .vscode/
 .idea/
 *.swp
