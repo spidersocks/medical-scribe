@@ -257,6 +257,7 @@ async def transcribe_alibaba(websocket: WebSocket):
     recognizer: Optional[Recognition] = None
 
     async def forward_events():
+        """Reads processed events from the queue and sends them to the frontend."""
         try:
             while True:
                 item = await queue.get()
@@ -266,6 +267,7 @@ async def transcribe_alibaba(websocket: WebSocket):
                             await websocket.close(code=1011, reason=item.get("message") or "Transcription service error")
                         break
                     if item.get("_complete"):
+                        # Only close the WS once Alibaba says it is completely done processing
                         if websocket.client_state == WebSocketState.CONNECTED:
                             await websocket.close()
                         break
@@ -280,15 +282,11 @@ async def transcribe_alibaba(websocket: WebSocket):
             logger.error("forward_events error: %s", e)
 
     async def receive_audio():
+        """Reads audio chunks from the frontend and sends them to Alibaba."""
         try:
             while True:
                 data = await websocket.receive_bytes()
                 if not data:
-                    try:
-                        if recognizer:
-                            recognizer.send_end_flag()
-                    except Exception:
-                        pass
                     break
                 try:
                     if recognizer:
@@ -297,24 +295,26 @@ async def transcribe_alibaba(websocket: WebSocket):
                     logger.error("send_audio_frame error: %s", e)
                     break
         except WebSocketDisconnect:
-            logger.info("Client disconnected (WebSocketDisconnect)")
-            try:
-                if recognizer:
-                    recognizer.send_end_flag()
-            except Exception:
-                pass
+            logger.info("Client disconnected (WebSocketDisconnect) - stopping recording")
         except asyncio.CancelledError:
             if DBG:
                 logger.debug("receive_audio cancelled")
         except Exception as e:
             logger.error("receive_audio error: %s", e)
+        finally:
+            # Signal end of audio stream to Alibaba
+            try:
+                if recognizer:
+                    logger.info("Sending end flag to Alibaba...")
+                    recognizer.send_end_flag()
+            except Exception:
+                pass
 
     try:
         recognizer = Recognition(
             model="paraformer-realtime-v2",
             format="pcm",
             sample_rate=16000,
-            # diarization removed – model unsupported
             diarization_enabled=False,
             language_hints=["en", "yue", "zh"],
             callback=callback,
@@ -325,22 +325,18 @@ async def transcribe_alibaba(websocket: WebSocket):
         recognizer.start()
         logger.info("DashScope recognizer started (placeholder speakers)")
 
+        # Start both tasks
         sender_task = asyncio.create_task(forward_events())
         audio_task = asyncio.create_task(receive_audio())
 
-        done, pending = await asyncio.wait(
-            {sender_task, audio_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except Exception:
-                pass
-        for task in done:
-            if task.exception():
-                logger.error("Task finished with exception: %s", task.exception())
+        # Wait for audio_task to finish (client stops sending)
+        await audio_task
+
+        # CRITICAL FIX: Do NOT cancel sender_task immediately.
+        # Wait for Alibaba to finish processing the last chunks and trigger on_complete.
+        # on_complete puts {"_complete": True} in the queue, which causes forward_events to exit.
+        logger.info("Audio stream ended. Waiting for pending transcription events...")
+        await sender_task
 
     except Exception as e:
         logger.exception("Transcription session error: %s", e)
