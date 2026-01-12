@@ -256,7 +256,7 @@ class ParaformerCallback(RecognitionCallback):
 @router.websocket("/alibaba")
 async def transcribe_alibaba(
     websocket: WebSocket, 
-    consultation_id: Optional[str] = Query(None) # Get consultation ID for fallback saving
+    consultation_id: Optional[str] = Query(default=None) # Correct usage of Query
 ):
     await websocket.accept()
     logger.info("WebSocket connected (/transcribe/alibaba) for consultation_id=%s", consultation_id)
