@@ -6,9 +6,13 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from starlette.websockets import WebSocketState
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
+
+# Services for direct saving fallback
+from services import transcript_segment_service
+from schemas.transcript_segment import TranscriptSegmentCreate
 
 # Optional enrichment (translation + entities via AWS services)
 try:
@@ -239,6 +243,10 @@ class ParaformerCallback(RecognitionCallback):
                 entities=entities,
                 debug=dbg if DBG else None,
             )
+            # Pass final flag for fallback logic in main loop
+            payload["_is_final_sentence"] = is_final 
+            payload["_sequence_number"] = self.final_counter
+            
             self._emit(payload)
 
         except Exception as exc:
@@ -246,9 +254,12 @@ class ParaformerCallback(RecognitionCallback):
 
 # --- WebSocket endpoint ---
 @router.websocket("/alibaba")
-async def transcribe_alibaba(websocket: WebSocket):
+async def transcribe_alibaba(
+    websocket: WebSocket, 
+    consultation_id: Optional[str] = Query(None) # Get consultation ID for fallback saving
+):
     await websocket.accept()
-    logger.info("WebSocket connected (/transcribe/alibaba)")
+    logger.info("WebSocket connected (/transcribe/alibaba) for consultation_id=%s", consultation_id)
     os.environ.setdefault("DASHSCOPE_API_KEY", os.getenv("DASHSCOPE_API_KEY", ""))
 
     loop = asyncio.get_running_loop()
@@ -266,15 +277,55 @@ async def transcribe_alibaba(websocket: WebSocket):
                         if websocket.client_state == WebSocketState.CONNECTED:
                             await websocket.close(code=1011, reason=item.get("message") or "Transcription service error")
                         break
+                    
                     if item.get("_complete"):
                         # Only close the WS once Alibaba says it is completely done processing
                         if websocket.client_state == WebSocketState.CONNECTED:
                             await websocket.close()
                         break
-                    if websocket.client_state == WebSocketState.CONNECTED:
-                        await websocket.send_text(json.dumps(item))
-                    else:
-                        break
+
+                    # --- CRITICAL FIX: Graceful Shutdown Fallback ---
+                    # If the socket is closed but we have a FINAL sentence, save it directly to DB.
+                    is_ws_open = (websocket.client_state == WebSocketState.CONNECTED)
+                    is_final = item.get("_is_final_sentence", False)
+
+                    if is_ws_open:
+                        try:
+                            # Strip internal flags before sending to frontend
+                            frontend_item = {k: v for k, v in item.items() if not k.startswith("_")}
+                            await websocket.send_text(json.dumps(frontend_item))
+                        except Exception:
+                            # If sending fails, mark as closed for the fallback logic
+                            is_ws_open = False
+                    
+                    if not is_ws_open and is_final and consultation_id:
+                        # FALLBACK: Save directly to DynamoDB
+                        logger.warning("[Graceful Shutdown] WebSocket closed. Saving orphaned segment directly to DB.")
+                        try:
+                            res = item["Transcript"]["Results"][0]
+                            text = item.get("DisplayText", "")
+                            
+                            # Construct create payload
+                            # We use the internal sequence counter from the callback
+                            seq_num = item.get("_sequence_number", 0) 
+                            
+                            payload = TranscriptSegmentCreate(
+                                consultation_id=consultation_id,
+                                sequence_number=seq_num, # Best effort sequence
+                                speaker_label=res.get("Speaker"),
+                                original_text=text,
+                                translated_text=item.get("TranslatedText"),
+                                detected_language=res.get("LanguageCode"),
+                                start_time_ms=res.get("StartTimeMs"),
+                                end_time_ms=res.get("EndTimeMs"),
+                                entities=item.get("ComprehendEntities")
+                            )
+                            # Run in background so we don't block the queue
+                            await transcript_segment_service.create(payload)
+                            logger.info("[Graceful Shutdown] Orphaned segment saved successfully.")
+                        except Exception as e:
+                            logger.error("[Graceful Shutdown] Failed to save orphaned segment: %s", e)
+
         except asyncio.CancelledError:
             if DBG:
                 logger.debug("forward_events cancelled")
@@ -332,9 +383,7 @@ async def transcribe_alibaba(websocket: WebSocket):
         # Wait for audio_task to finish (client stops sending)
         await audio_task
 
-        # CRITICAL FIX: Do NOT cancel sender_task immediately.
-        # Wait for Alibaba to finish processing the last chunks and trigger on_complete.
-        # on_complete puts {"_complete": True} in the queue, which causes forward_events to exit.
+        # Wait for Alibaba to finish processing the last chunks
         logger.info("Audio stream ended. Waiting for pending transcription events...")
         await sender_task
 
