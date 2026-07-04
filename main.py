@@ -798,6 +798,11 @@ def create_app() -> FastAPI:
 
 # -------- Routes registration (includes WebSocket proxy) --------
 def register_routes(app: FastAPI) -> None:
+    @app.get("/healthz")
+    async def healthz() -> Dict[str, str]:
+        # Keep this endpoint lightweight for free-tier warmup probes.
+        return {"status": "ok", "service": "medical-scribe"}
+
     @app.websocket("/client-transcribe")
     async def client_transcribe(ws: WebSocket) -> None:
         """
