@@ -47,7 +47,7 @@ logging.getLogger("services").setLevel(logging.DEBUG)
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 
 # Target Alibaba Cloud Model
-DASHSCOPE_MODEL_ID = "qwen3-next-80b-a3b-instruct"
+DASHSCOPE_MODEL_ID = "qwen-flash"
 
 # API router and services
 try:
@@ -221,11 +221,11 @@ def _translate_large_text(source_lang: str, target_lang: str, text: str) -> str:
 
     def _call_qwen(chunk: str) -> str:
         try:
-            # qwen-mt-turbo only supports 'user' and 'assistant' roles, not 'system'
+            # qwen-mt-flash only supports 'user' and 'assistant' roles, not 'system'
             # So we prepend the system prompt to the user message
             combined_message = f"{sys_prompt}\n\n{chunk}"
             response = dashscope.Generation.call(
-                model='qwen-mt-turbo',
+                model='qwen-mt-flash',
                 messages=[
                     {'role': Role.USER, 'content': combined_message}
                 ],
